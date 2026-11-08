@@ -1,0 +1,62 @@
+From d86b7bbcb905c402e18b05c3c915c1d393053a53 Mon Sep 17 00:00:00 2001
+From: palermostest25 <117061771+palermostest25@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 11:34:16 +0800
+Subject: [PATCH 10/11] eDP keep: a scaled mode's source size is recorded, not
+ blocking (the scaler branch rewrites PIPESRC)
+
+---
+ WhateverXe/kern_display13_edp_keep.hpp | 9 ++++++---
+ tests/display13_edp_keep.cpp           | 9 +++++----
+ 2 files changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/WhateverXe/kern_display13_edp_keep.hpp b/WhateverXe/kern_display13_edp_keep.hpp
+index a88f005..cb20150 100644
+--- a/WhateverXe/kern_display13_edp_keep.hpp
++++ b/WhateverXe/kern_display13_edp_keep.hpp
+@@ -29,8 +29,11 @@ enum Reason : uint32_t {
+  Sink=1U<<7,      // DPCD lane status not trained (recorded only)
+  Blanking=1U<<8,  // totals or sync positions differ (recorded only: the pipe
+                   // keeps the firmware's refresh of the same active image)
++ Source=1U<<9,    // PIPESRC differs: a scaled mode over the same active image
++                  // (recorded only: the donor's scaler branch, programPipeScaler,
++                  // rewrites PIPESRC from the path when the scaler changes)
+ };
+-constexpr uint32_t Blocking=~uint32_t(Sink|Blanking);
++constexpr uint32_t Blocking=~uint32_t(Sink|Blanking|Source);
+ // Registers in Live/record order: TRANS_DDI_FUNC_CTL, TRANSCONF, then the six
+ // timing words and PIPESRC.
+ constexpr uint32_t LiveRegisters[]={0x60400,0x70008,0x60000,0x60004,0x60008,0x6000C,0x60010,0x60014,0x6001C};
+@@ -53,8 +56,8 @@ inline uint32_t compare(const Live &live,const Wanted &want,uint32_t portLanes)
+  uint32_t reasons=0;
+  if((live.transconf&0xC0000000U)!=0xC0000000U)reasons|=PipeOff;
+  // HTOTAL/VTOTAL bits 13:0 (12:0) hold the active size minus one.
+- if((live.timing[0]&0x3FFFU)!=(want.timing[0]&0x3FFFU) || (live.timing[3]&0x1FFFU)!=(want.timing[3]&0x1FFFU) ||
+-    live.source!=want.source)reasons|=Timing;
++ if((live.timing[0]&0x3FFFU)!=(want.timing[0]&0x3FFFU) || (live.timing[3]&0x1FFFU)!=(want.timing[3]&0x1FFFU))reasons|=Timing;
++ if(live.source!=want.source)reasons|=Source;
+  for(unsigned i=0;i<6;++i)if(live.timing[i]!=want.timing[i])reasons|=Blanking;
+  const auto lanes=((live.func>>1)&7)+1;
+  if(lanes!=portLanes || ((want.func>>1)&7)+1!=lanes || ((live.func^want.func)&0x00700000U))reasons|=Format;
+diff --git a/tests/display13_edp_keep.cpp b/tests/display13_edp_keep.cpp
+index 9c61ad0..cfcad92 100644
+--- a/tests/display13_edp_keep.cpp
++++ b/tests/display13_edp_keep.cpp
+@@ -69,10 +69,11 @@ int main() {
+     // A different active image is never kept.
+     {Mode t=panel;t.ha=1680;t.hb=400;params(p,t);assert(compare(l,wanted(p),2)&Timing);}
+     {Mode t=panel;t.va=1050;t.vb=186;params(p,t);assert(compare(l,wanted(p),2)&Timing);}
+-    {params(p,panel);uint32_t source=0x063F04AF;memcpy(p+0x28,&source,4);assert(compare(l,wanted(p),2)==Timing);}
+-    // The firmware's 1024x768 GOP mode scaled to the panel (OpenCore Resolution
+-    // below Max, as on the IdeaPad): the same-mode branch never rewrites PIPESRC.
+-    {params(p,panel);auto scaled=l;scaled.source=0x03FF02FF;assert(compare(scaled,wanted(p),2)==Timing);}
++    // A scaled mode (another source size over the same active image) is kept:
++    // the donor's scaler branch rewrites PIPESRC.
++    {params(p,panel);uint32_t source=0x09FF063F;memcpy(p+0x28,&source,4);const auto r=compare(l,wanted(p),2);assert(r==Source && !(r&Blocking));}
++    // The firmware's 1024x768 GOP mode scaled to the panel: only the source differs.
++    {params(p,panel);auto scaled=l;scaled.source=0x03FF02FF;assert(compare(scaled,wanted(p),2)==Source);}
+     // Lane count or depth the donor wants differ from the live link (the rate
+     // is never compared: the same-mode branch does not touch the link).
+     params(p,panel);
+-- 
+2.50.1 (Apple Git-155)
+

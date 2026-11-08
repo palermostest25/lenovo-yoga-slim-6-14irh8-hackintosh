@@ -1,0 +1,175 @@
+From 752d821512aed861c4d3062e6f56c19eaa2e81ec Mon Sep 17 00:00:00 2001
+From: thatisjigen <55486333+Thatisjigen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:18:36 +0100
+Subject: [PATCH 01/11] Admit the eDP boot port with native mode 0 at the
+ firmware handoff
+
+At the handoff a Combo eDP port still has native mode 0: Apple's setPortMode
+has not run yet, and display13SSTPort requires exactly 1. The boot port is
+rejected, adoptDPBootAUX and adoptBootPath are never reached, the handoff
+returns NotReady and the controller start is not accepted, so there is no
+accelerator (N97FramebufferStartAccepted = No).
+
+Admit mode 0 for the handoff only, on the same terms as display13SSTPort and
+only on the Combo DDI the VBT names as the panel. adoptDPBootAUX and the
+source checks still have to pass. display13SSTPort does not change, so AUX,
+link training and every other caller keep the exact check. A board with no
+VBT panel, or an external DP or HDMI route on a Combo DDI, gets the same
+answer as before. Raptor Lake-U IDs stay out: the documentation calls their
+display clock unimplemented, and today they keep a usable boot framebuffer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ WhateverXe/kern_xe.cpp           | 24 +++++++++++++++++-
+ WhateverXe/kern_xe.hpp           |  1 +
+ WhateverXe/kern_xelp_devices.hpp |  5 ++++
+ tests/display13_sst.py           |  2 +-
+ tests/display13_sst_fixture.cpp  | 42 +++++++++++++++++++++++++++++++-
+ 5 files changed, 71 insertions(+), 3 deletions(-)
+
+diff --git a/WhateverXe/kern_xe.cpp b/WhateverXe/kern_xe.cpp
+index 7b8316b..aaa0818 100644
+--- a/WhateverXe/kern_xe.cpp
++++ b/WhateverXe/kern_xe.cpp
+@@ -7558,6 +7558,25 @@ uint8_t *XE::display13SSTPort(void *port) {
+  return p;
+ }
+ 
++// At the firmware handoff a Combo eDP port still has native mode 0: Apple's setPortMode has not run yet, and
++// display13SSTPort requires exactly 1 (the AUX gate already accepts 0 or 1 on Combo ports). Admit that one case for the
++// handoff only: the same terms, on the DDI the VBT names as the panel. Every other caller keeps the exact check, and
++// Raptor Lake-U stays on the boot framebuffer until its display clock is implemented.
++uint8_t *XE::display13PanelBootPort(void *port) {
++ auto s=callbackXE;auto &c=display13FBPower;auto object=static_cast<OSObject *>(port);
++ if(!s->display13FramebufferRequested || s->xeProfile.display!=XELP::Display::XeLPD || XELP::raptorLakeUDevice(s->xeProfile.identity) ||
++    !s->display13FBSSTHooksReady ||
++    !object || object->getMetaClass()->getClassSize()<0x624 || !c.controller ||
++    c.controller!=s->adlnTopologyController || !adlnWriterMappingBound() ||
++    c.clockFaulted || c.memoryFaulted || c.panelFaulted || c.clockStopped || !s->adlnOutputWiring.described())return nullptr;
++ auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
++ if(!config || !Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring) ||
++    config[0]>=2 || !(s->adlnOutputWiring.panel&(1U<<config[0])) || p[0x117] ||
++    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || Display13FBMemory::field<uint32_t>(p,0x550)!=0 ||
++    Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
++ return p;
++}
++
+ bool XE::display13HDMIPort(void *port) {
+  auto s=callbackXE;auto object=static_cast<OSObject *>(port);
+  if(!object || object->getMetaClass()->getClassSize()<0x580)return false;
+@@ -8481,7 +8500,10 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
+                 const auto ddi=c.bridge.bootPort;
+                 const bool dp=ddi<7 && (callbackXE->adlnOutputWiring.links()&(1U<<ddi));
+                 bool linked=!dp;
+-                if(dp && display13SSTPort(port)) {
++                const bool sst=dp && display13SSTPort(port);
++                const bool panelBoot=dp && !sst && display13PanelBootPort(port);
++                if(panelBoot)SYSLOG("igfx","Display13 eDP boot port on DDI %u admitted with native mode 0",ddi);
++                if(sst || panelBoot) {
+                     Display13FBBootIO io{c.map};auto &boot=c.displayScratch;AlderLakeN::readDisplay(io,true,boot);
+                     if(ddi>=3) {
+                         const auto source=Display13TC::Boot::capture(io,true,ddi,0);
+diff --git a/WhateverXe/kern_xe.hpp b/WhateverXe/kern_xe.hpp
+index b35a3d4..f0748ce 100644
+--- a/WhateverXe/kern_xe.hpp
++++ b/WhateverXe/kern_xe.hpp
+@@ -216,6 +216,7 @@ private:
+  static bool display13DeferClock(void *access,uint64_t reg,uint32_t value,uintptr_t caller);
+ 
+  static uint8_t *display13SSTPort(void *port);
++ static uint8_t *display13PanelBootPort(void *port);
+  static bool display13HDMIPort(void *port);
+  static uint32_t wrapDisplay13TrainingPattern(void *path,uint32_t pattern);
+  static uint32_t wrapDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphasis,void *overrideConfig);
+diff --git a/WhateverXe/kern_xelp_devices.hpp b/WhateverXe/kern_xelp_devices.hpp
+index b696dc5..e8b62cf 100644
+--- a/WhateverXe/kern_xelp_devices.hpp
++++ b/WhateverXe/kern_xelp_devices.hpp
+@@ -92,6 +92,11 @@ inline bool mobileDisplay13Device(uint32_t pci) {
+     const auto e=deviceEntry(pci);
+     return e && e->backend==GT::ADLPMobile;
+ }
++// Recognized, but their dedicated display-clock handling is not implemented: docs/device-selection.md.
++inline bool raptorLakeUDevice(uint32_t pci) {
++    if((pci&0xFFFF)!=0x8086)return false;
++    const auto id=pci>>16;return id==0xA721 || id==0xA7A1 || id==0xA7A9 || id==0xA7AC || id==0xA7AD;
++}
+ inline bool desktopGTDevice(uint32_t pci) {
+     const auto e=deviceEntry(pci);
+     return e && (e->family==Family::AlderLakeS || e->family==Family::RaptorLakeS);
+diff --git a/tests/display13_sst.py b/tests/display13_sst.py
+index ac34a11..1b15f9a 100644
+--- a/tests/display13_sst.py
++++ b/tests/display13_sst.py
+@@ -4,7 +4,7 @@ from pathlib import Path
+ import hashlib,re,subprocess,sys,tempfile
+ r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_xe.cpp').read_text()
+ functions='\n'.join(re.search(re.escape(sig)+r'.*?\n\}',s,re.S).group() for sig in [
+- 'uint8_t *XE::display13SSTPort(', 'bool XE::display13HDMIPort(', 'bool XE::display13MainLinkAUX(',
++ 'uint8_t *XE::display13SSTPort(', 'uint8_t *XE::display13PanelBootPort(', 'bool XE::display13HDMIPort(', 'bool XE::display13MainLinkAUX(',
+  'uint32_t XE::wrapDisplay13EnablePort(', 'uint32_t XE::wrapDisplay13DisablePort(',
+  'uint32_t XE::wrapDisplay13SignalLevels(', 'uint32_t XE::wrapDisplay13TrainingPattern('])
+ binding=re.search(r'static TGLFBBinding::Readout adlnInspectPathBinding\(.*?\n\}',s,re.S).group()
+diff --git a/tests/display13_sst_fixture.cpp b/tests/display13_sst_fixture.cpp
+index 3beb1ee..1a26ede 100644
+--- a/tests/display13_sst_fixture.cpp
++++ b/tests/display13_sst_fixture.cpp
+@@ -68,7 +68,7 @@ struct XE {
+  uintptr_t orgDisplay13EnablePort=0,orgDisplay13DisablePort=0;
+  static bool display13MainLinkAUX(void*,bool,bool=false);
+  static uint32_t wrapDisplay13EnablePort(void*);static uint32_t wrapDisplay13DisablePort(void*);
+- static uint8_t *display13SSTPort(void*);static bool display13HDMIPort(void*);
++ static uint8_t *display13SSTPort(void*);static uint8_t *display13PanelBootPort(void*);static bool display13HDMIPort(void*);
+  static uint32_t wrapDisplay13TCSignal(void*,uint32_t,uint32_t,void*){assert(false);return 1;}
+  static uint32_t wrapDisplay13SignalLevels(void*,uint32_t,uint32_t,void*);
+  static uint32_t wrapDisplay13TrainingPattern(void*,uint32_t);
+@@ -186,6 +186,46 @@ int main(int argc,char **argv){
+   assert(!XE::wrapDisplay13EnablePort(f.port));assert(!XE::wrapDisplay13DisablePort(f.port));assert(objectRefs.empty());
+   display13FBPower.panelFaulted=true;assert(!XE::display13SSTPort(f.port));
+  }
++ // Firmware handoff: a Combo eDP port still in native mode 0 passes only as the VBT panel. Mode 1, Type-C modes, an
++ // external DP or HDMI route on the same DDI, and every other term of the exact check stay as they were.
++ unsigned panelBootCases=0;
++ for(unsigned ddi=0;ddi<2;++ddi) {
++  Fixture f(0,0,ddi);Map map;setup(f,map,ddi,0,4,20,true);
++  assert(XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));
++  put(f.port,0x550,0U);assert(!XE::display13SSTPort(f.port)&&XE::display13PanelBootPort(f.port)==f.port);++panelBootCases;
++  for(unsigned mode:{2U,3U,4U}){put(f.port,0x550,mode);assert(!XE::display13PanelBootPort(f.port));++panelBootCases;}
++  put(f.port,0x550,0U);assert(XE::display13PanelBootPort(f.port));
++  auto &c=display13FBPower;
++  for(bool *fault:{&c.clockFaulted,&c.memoryFaulted,&c.panelFaulted,&c.clockStopped}) {
++   *fault=true;assert(!XE::display13PanelBootPort(f.port));*fault=false;++panelBootCases;
++  }
++  f.port[0x117]=1;assert(!XE::display13PanelBootPort(f.port));f.port[0x117]=0;++panelBootCases;
++  put(f.port,0x120,1-ddi);assert(!XE::display13PanelBootPort(f.port));put(f.port,0x120,ddi);++panelBootCases;
++  put(f.port,0x578,static_cast<void *>(f.fb));assert(!XE::display13PanelBootPort(f.port));put(f.port,0x578,static_cast<void *>(f.access));++panelBootCases;
++  bound=false;assert(!XE::display13PanelBootPort(f.port));bound=true;++panelBootCases;
++  state.display13FBSSTHooksReady=false;assert(!XE::display13PanelBootPort(f.port));state.display13FBSSTHooksReady=true;++panelBootCases;
++  state.xeProfile.display=XELP::Display::XeD;assert(!XE::display13PanelBootPort(f.port));state.xeProfile.display=XELP::Display::XeLPD;++panelBootCases;
++  for(uint32_t id:{0xA7218086U,0xA7A18086U,0xA7A98086U,0xA7AC8086U,0xA7AD8086U}){state.xeProfile.identity=id;assert(!XE::display13PanelBootPort(f.port));++panelBootCases;}
++  for(uint32_t id:{0xA7208086U,0xA7A08086U,0xA7A88086U,0xA7AA8086U,0xA7AB8086U,0x46A68086U,0x46D08086U}){state.xeProfile.identity=id;assert(XE::display13PanelBootPort(f.port));++panelBootCases;}
++  state.xeProfile.identity=0;
++  // No other SST caller is loosened: with mode 0 they still refuse, once the native mode is set they run as before.
++  assert(XE::display13PanelBootPort(f.port));
++  assert(XE::wrapDisplay13EnablePort(f.port)==kIOReturnNotReady&&!linkCalls);
++  put(f.port,0x550,1U);assert(!XE::display13PanelBootPort(f.port)&&XE::display13SSTPort(f.port));
++  assert(!XE::wrapDisplay13EnablePort(f.port));assert(!XE::wrapDisplay13DisablePort(f.port));assert(objectRefs.empty());
++ }
++ for(unsigned ddi=0;ddi<2;++ddi) {
++  Fixture f(0,0,ddi);Map map;setup(f,map,ddi,0,4,20);
++  put(f.port,0x550,0U);assert(!XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));++panelBootCases;
++  assert(objectRefs.empty());
++ }
++ {
++  // A Type-C DP route is not a Combo handoff.
++  Fixture f(0,0,3);Map map;setup(f,map,3,0,4,20);
++  put(f.port,0x550,0U);assert(!XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));++panelBootCases;
++  assert(objectRefs.empty());
++ }
++ printf("PASS Display13 eDP boot handoff: %u mode 0 admission cases, only the VBT panel on Combo A/B\n",panelBootCases);
+  unsigned count=0,replays=0;
+  for(unsigned ddi=0;ddi<2;++ddi)for(unsigned pipe=0;pipe<3;++pipe)for(unsigned lanes:{1U,2U,4U})
+  for(unsigned rate:{6U,10U,20U,30U})for(unsigned swing=0;swing<4;++swing)for(unsigned emphasis=0;emphasis<4-swing;++emphasis){
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,949 @@
+From 0113f4a43760c72b332ea24e9c6d1cc94fcbb0b5 Mon Sep 17 00:00:00 2001
+From: nickk19 <nikko8204@gmail.com>
+Date: Thu, 5 Nov 2026 16:27:36 +0000
+Subject: [PATCH 03/11] Display13 eDP: keep the firmware-trained panel link
+ (-wex-edp-keep)
+
+The donor answers the first mode set of the boot panel with a complete
+mode set: disableDisplay stops the link the firmware trained and
+LightUpEDP trains it again. On the Lenovo IdeaPad Slim 5 14IAH8
+(i5-12450H, 46A3) its Samsung ATNA40CT01 1920x1200 OLED never completes
+that training: clock recovery locks, channel equalization fails with
+TPS4 and TPS3 in either pattern order ("Phase 2 of link training
+failed"), and the panel stays dark.
+
+With -wex-edp-keep, hook hwRegsNeedUpdate (Tahoe TGL framebuffer, entry
+address and prologue checked) and answer "no update" when
+- the path is the boot path WEX adopted at the firmware handoff, on the
+  panel's Combo DDI and pipe A,
+- the firmware's eDP SST source still runs (AlderLakeN::dpSource on a
+  fresh readout) and TRANSCONF is enabled and active,
+- the pipe already has the requested active size and PIPESRC, and the
+  requested lane count and depth.
+The donor's own same-mode branch then switches only the plane and scaler
+to its surface ("Partial modeset by updating plane/scaler"), leaves the
+path attached and returns success; the link is never stopped, as with
+NootedGreen's firmware-link mode and Linux i915 fastboot. Anything else
+keeps the donor's answer. The link rate is not compared: the same-mode
+branch does not touch the DPLL, the DDI or the M/N values. The panel's
+Combo port can still have the handoff's native mode 0, so the decision
+accepts it on display13PanelBootPort's terms.
+
+So that the donor requests the firmware's format, the switch also caps
+the panel's receiver caps at HBR in every view getDPCDInfo and the link
+setup read (MAX_LINK_RATE, extended caps, SUPPORTED_LINK_RATES and the
+LINK_BW_SET read back), which gives a 1920x1200@60 mode the firmware's
+two lanes, and reports the panel EDID's depth and the mode set's
+maximum as 8 bpc. Nothing is written to the sink.
+
+WEXEDPKeepFirst and WEXEDPKeep record the first and last decisions
+(reasons bitmask, live and requested registers, DPCD lane status),
+WEXEDPKeepReady the hook. The firmware must leave the panel at its
+native timing: OpenCore UEFI > Output > Resolution = Max.
+
+Display sleep, a resolution change or system sleep still make the donor
+retrain the link and leave the panel dark; README lists the limitation.
+
+Tested on the IdeaPad Slim 5 14IAH8 with macOS Tahoe 26.7.1: the first
+decision keeps the link and the desktop runs with Metal
+(AppleIntelTGLGraphicsMTLDriver), 1080p video and the hardware cursor.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ README.md                                  |   9 +-
+ README_ja.md                               |   9 +-
+ WhateverXe/kern_display13_edp_keep.hpp     | 100 +++++++++++++
+ WhateverXe/kern_xe.cpp                     | 119 ++++++++++++++-
+ WhateverXe/kern_xe.hpp                     |   2 +
+ tests/display13_aux.py                     |   5 +-
+ tests/display13_edp_keep.cpp               | 123 +++++++++++++++
+ tests/display13_edp_keep_route.py          |  55 +++++++
+ tests/display13_edp_keep_route_fixture.cpp | 165 +++++++++++++++++++++
+ tests/display13_edp_keep_stubs.hpp         |  30 ++++
+ tests/fixtures/boot_argument_names.json    |   1 +
+ tests/tgl_panel_depth_route.py             |  11 ++
+ tools/test.py                              |   3 +-
+ 13 files changed, 622 insertions(+), 10 deletions(-)
+ create mode 100644 WhateverXe/kern_display13_edp_keep.hpp
+ create mode 100644 tests/display13_edp_keep.cpp
+ create mode 100644 tests/display13_edp_keep_route.py
+ create mode 100644 tests/display13_edp_keep_route_fixture.cpp
+ create mode 100644 tests/display13_edp_keep_stubs.hpp
+
+diff --git a/README.md b/README.md
+index bd1de69..7aa8c44 100644
+--- a/README.md
++++ b/README.md
+@@ -23,7 +23,7 @@ Sequoia and Tahoe accept compatible updates within their OS family. Future Apple
+ - Tiger Lake-U: 48- and 80-EU configurations.
+ - Alder Lake-N: 16- and 24-EU configurations.
+ - Twin Lake: 32-EU configurations.
+-- Alder Lake-H: 96-EU configurations, including single-channel operation.
++- Alder Lake-H: 48- and 96-EU configurations, including single-channel operation.
+ - Alder Lake-S: UHD Graphics 770.
+ 
+ See [tested features and known issues](#tested-features-and-known-issues) for OS coverage and display configurations. PCI IDs are listed in [device selection](docs/device-selection.md).
+@@ -34,7 +34,7 @@ See [tested features and known issues](#tested-features-and-known-issues) for OS
+ - Other supported Alder Lake-N / Twin Lake configurations.
+ - Other supported Alder Lake-H/P/U and Raptor Lake-H/P configurations.
+ - Other supported Alder Lake-S/HX and Raptor Lake-S/HX configurations.
+-- Internal eDP on Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P is implemented but has not been tested on hardware.
++- Internal eDP on Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P is implemented; on hardware it has been tested only with the firmware's panel link kept (`-wex-edp-keep`, see [other settings](#other-settings)).
+ 
+ ### Further implementation required
+ 
+@@ -83,6 +83,7 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
+ - Add `SSDT-PNLF` for internal-display brightness control.
+ - GPU selection is automatic; a `device-id` override is normally unnecessary.
+ - Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P select tiling automatically. Do not use `-yTileDisable`; `AAPL,GfxYTile` is unnecessary.
++- If an Alder Lake-H/P/U / Raptor Lake-H/P internal panel goes dark when macOS takes over the boot screen, add `-wex-edp-keep` and set OpenCore `UEFI > Output > Resolution` to `Max`. WEX then keeps the panel link the firmware trained instead of training it again. Display off/on is not supported in this mode, so disable display sleep.
+ 
+ ## Tested features and known issues
+ 
+@@ -95,6 +96,7 @@ The common regression checks cover Metal, OpenGL, OpenCL, hardware H.264 encode/
+ | Alder Lake-N mini PCs | Big Sur–Tahoe: 16/24 EU, two 1080p60 HDMI displays and display off/on |
+ | Alder Lake-N / Twin Lake laptops | MIPI DSI on MicroPC 2 (N250) and MiniBook X N100. Big Sur: brightness, rotation, display off/on and external HDMI/USB-C coexistence; MicroPC 2 also has HiDPI and up to three displays. Tahoe: MicroPC 2 internal/external displays, brightness, rotation and HiDPI |
+ | Alder Lake-H | Big Sur–Tahoe: 96 EU, three displays using HDMI and a DP-to-HDMI adapter. Single-channel `4626` graphics acceleration checked on Big Sur |
++| Alder Lake-H laptops | Tahoe: 48 EU, internal 1920x1200 OLED eDP with `-wex-edp-keep`. Display off/on and OLED brightness are unsupported |
+ | Alder Lake-S | Big Sur–Tahoe: UHD 770, HDMI/DP/USB-C and up to three displays; Safari video, with Widevine checked on Big Sur/Tahoe |
+ 
+ MIPI DSI support is **experimental and tested only on GPD MicroPC 2 and CHUWI MiniBook X N100**. Do not expect it to work on other devices.
+@@ -105,6 +107,7 @@ MIPI DSI support is **experimental and tested only on GPD MicroPC 2 and CHUWI Mi
+ - Some image-conversion operations can crash applications; App Store video can freeze the GPU on Sequoia.
+ - Safari video may occasionally drop frames. FairPlay-protected playback is unsupported.
+ - Up to three displays are supported. Resolutions beyond the tested configurations and full system sleep/wake remain unverified.
++- With `-wex-edp-keep`, display sleep, a resolution change or system sleep leaves the internal panel dark until restart.
+ - Some connector layouts and backlight methods, MST and Thunderbolt-managed outputs are unsupported.
+ 
+ ### Roadmap
+@@ -131,4 +134,4 @@ See [LICENSE.txt](LICENSE.txt). Lilu and MacKernelSDK are separate dependencies.
+ 
+ Thanks to [JulioNectar/XPS13Plus](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe) for sharing its Xe graphics work. Its compiler adapter and LLVM bridge informed the OS-native AIR conversion used in WhateverXe Graphics.
+ 
+-Internal-panel work also draws on [WhateverXe-RaptorLakeP](https://github.com/samranahmad09/WhateverXe-RaptorLakeP), [X1Carbon-G11](https://github.com/dssoftx/Hackintosh-X1Carbon-G11-IrisXe-Tahoe), XPS13Plus and the [Linux i915 display sources](https://github.com/torvalds/linux/tree/v6.12/drivers/gpu/drm/i915/display) for hardware behavior and implementation comparisons.
++Internal-panel work also draws on [WhateverXe-RaptorLakeP](https://github.com/samranahmad09/WhateverXe-RaptorLakeP), [X1Carbon-G11](https://github.com/dssoftx/Hackintosh-X1Carbon-G11-IrisXe-Tahoe), XPS13Plus and the [Linux i915 display sources](https://github.com/torvalds/linux/tree/v6.12/drivers/gpu/drm/i915/display) for hardware behavior and implementation comparisons. Keeping the firmware's panel link follows [NootedGreen](https://github.com/sgiammori/NootedGreen)'s firmware-link mode and Linux i915 fastboot.
+diff --git a/README_ja.md b/README_ja.md
+index dd36587..9948dbe 100644
+--- a/README_ja.md
++++ b/README_ja.md
+@@ -23,7 +23,7 @@ SequoiaとTahoeは同じOS系列内の互換性のある更新に対応します
+ - Tiger Lake-U：48 EU・80 EU構成。
+ - Alder Lake-N：16 EU・24 EU構成。
+ - Twin Lake：32 EU構成。
+-- Alder Lake-H：シングルチャネルを含む96 EU構成。
++- Alder Lake-H：シングルチャネルを含む48・96 EU構成。
+ - Alder Lake-S：UHD Graphics 770。
+ 
+ OS別の範囲と表示構成は[動作確認済みの機能と既知の問題](#動作確認済みの機能と既知の問題)、PCI IDは[デバイス選択](docs/device-selection.md)を参照してください。
+@@ -34,7 +34,7 @@ OS別の範囲と表示構成は[動作確認済みの機能と既知の問題](
+ - 対応IDの他のAlder Lake-N / Twin Lake構成。
+ - 対応IDの他のAlder Lake-H/P/U・Raptor Lake-H/P構成。
+ - 対応IDの他のAlder Lake-S/HX・Raptor Lake-S/HX構成。
+-- Alder Lake-N / Twin LakeとAlder Lake-H/P/U / Raptor Lake-H/Pの内蔵eDPは実装済み・実機未検証です。
++- Alder Lake-N / Twin LakeとAlder Lake-H/P/U / Raptor Lake-H/Pの内蔵eDPは実装済みです。実機ではファームウェアのパネルリンクを維持する設定（`-wex-edp-keep`、[その他の設定](#その他の設定)を参照）でのみ確認しています。
+ 
+ ### 対応に追加改修が必要
+ 
+@@ -83,6 +83,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
+ - 内蔵画面の輝度調整には`SSDT-PNLF`を追加します。
+ - GPUは自動選択するため、通常は`device-id`上書きは不要です。
+ - Alder Lake-N / Twin LakeとAlder Lake-H/P/U / Raptor Lake-H/Pではタイル形式を自動選択します。`-yTileDisable`は使わないでください。`AAPL,GfxYTile`は不要です。
++- Alder Lake-H/P/U / Raptor Lake-H/Pの内蔵画面がmacOSへの切り替わりで消える場合は、`-wex-edp-keep`を追加し、OpenCoreの`UEFI > Output > Resolution`を`Max`にします。WEXはファームウェアが確立したパネルリンクを再トレーニングせずに維持します。この設定では消灯復帰に対応しないため、ディスプレイのスリープを無効にしてください。
+ 
+ ## 動作確認済みの機能と既知の問題
+ 
+@@ -95,6 +96,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
+ | Alder Lake-NミニPC | Big Sur〜Tahoe：16/24 EU、1080p60のHDMI 2画面・消灯復帰 |
+ | Alder Lake-N / Twin Lakeラップトップ | MicroPC 2（N250）とMiniBook X N100のMIPI DSI。Big Sur：輝度・回転・消灯復帰・外部HDMI/USB-C共存。MicroPC 2はHiDPI・最大3画面も確認。Tahoe：MicroPC 2の内蔵／外部表示・輝度・回転・HiDPI |
+ | Alder Lake-H | Big Sur〜Tahoe：96 EU、HDMIとDP→HDMI変換器による3画面。シングルチャネル構成の`4626`でもBig Surの加速を確認 |
++| Alder Lake-Hラップトップ | Tahoe：48 EU、`-wex-edp-keep`による1920x1200有機ELの内蔵eDP。消灯復帰と有機ELの輝度調整は未対応 |
+ | Alder Lake-S | Big Sur〜Tahoe：UHD 770、HDMI/DP/USB-C、最大3画面、Safari動画。WidevineはBig Sur/Tahoeで確認 |
+ 
+ MIPI DSIは**GPD MicroPC 2とCHUWI MiniBook X N100のみで検証した試験的対応**です。それ以外の機器での動作は期待しないでください。
+@@ -105,6 +107,7 @@ MIPI DSIは**GPD MicroPC 2とCHUWI MiniBook X N100のみで検証した試験的
+ - 一部の画像変換でアプリがクラッシュし、SequoiaのApp Store動画ではGPUが停止することがあります。
+ - Safari動画で時折コマ落ちします。FairPlay保護コンテンツは未対応です。
+ - 同時表示は最大3画面です。検証構成を超える解像度とシステム全体のスリープ／復帰は未検証です。
++- `-wex-edp-keep`では、ディスプレイのスリープ・解像度変更・システムのスリープ後は再起動まで内蔵画面が消えたままになります。
+ - 一部の端子配線・輝度制御方式、MST、Thunderbolt管理の出力は未対応です。
+ 
+ ### ロードマップ
+@@ -130,4 +133,4 @@ WhateverXeはWhateverGreenの著作権表示とBSD-3-Clauseライセンスを継
+ 
+ Xeグラフィックスの取り組みを公開している[JulioNectar/XPS13Plus](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe)に感謝します。同リポジトリのcompiler adapterとLLVM bridgeを、WhateverXe GraphicsのOS標準AIR変換の参考にしました。
+ 
+-内蔵パネルの対応では、[WhateverXe-RaptorLakeP](https://github.com/samranahmad09/WhateverXe-RaptorLakeP)、[X1Carbon-G11](https://github.com/dssoftx/Hackintosh-X1Carbon-G11-IrisXe-Tahoe)、XPS13Plus、[Linux i915の表示ソース](https://github.com/torvalds/linux/tree/v6.12/drivers/gpu/drm/i915/display)も、ハードウェアの挙動と実装の比較に参照しています。
++内蔵パネルの対応では、[WhateverXe-RaptorLakeP](https://github.com/samranahmad09/WhateverXe-RaptorLakeP)、[X1Carbon-G11](https://github.com/dssoftx/Hackintosh-X1Carbon-G11-IrisXe-Tahoe)、XPS13Plus、[Linux i915の表示ソース](https://github.com/torvalds/linux/tree/v6.12/drivers/gpu/drm/i915/display)も、ハードウェアの挙動と実装の比較に参照しています。ファームウェアのパネルリンクの維持は、[NootedGreen](https://github.com/sgiammori/NootedGreen)のファームウェアリンクモードとLinux i915のfastbootに倣っています。
+diff --git a/WhateverXe/kern_display13_edp_keep.hpp b/WhateverXe/kern_display13_edp_keep.hpp
+new file mode 100644
+index 0000000..a88f005
+--- /dev/null
++++ b/WhateverXe/kern_display13_edp_keep.hpp
+@@ -0,0 +1,100 @@
++// -wex-edp-keep: keep the firmware-trained Display13 eDP link.
++// The donor answers the first panel mode set with a complete mode set: it
++// stops the firmware's link and trains it again, and some panels never
++// complete that training on display 13 (the IdeaPad Slim 5 14IAH8's Samsung
++// ATNA40CT01 OLED fails channel equalization in every pattern and order).
++// When the firmware's pipe already runs exactly the requested active image
++// over a live eDP SST link in the same format, hwRegsNeedUpdate can answer
++// "no update": the donor's own same-mode branch then only switches the plane
++// and scaler to its surface ("Partial modeset"), as Linux fastboot does, and
++// never stops the link.
++// Pure comparison of the live pipe A registers with the donor's CRTCParams
++// (AppleIntelFramebufferController::SetupTimings/SetupParams/enablePipe:
++// +0x4 TRANS_DDI_FUNC_CTL, +0x10..+0x24 TRANS_HTOTAL/HBLANK/HSYNC/VTOTAL/
++// VBLANK/VSYNC, +0x28 PIPESRC), plus the receiver-caps and EDID views that
++// make the donor choose the firmware's usual eDP format (two lanes at HBR,
++// 8 bits per component) in the first place.
++#ifndef KERN_DISPLAY13_EDP_KEEP_HPP
++#define KERN_DISPLAY13_EDP_KEEP_HPP
++#include <stdint.h>
++namespace Display13EDPKeep {
++enum Reason : uint32_t {
++ NotPanel=1U<<0,  // not the panel's SST port on pipe A, or foreign objects
++ NotBoot=1U<<1,   // not the boot path WhateverXe adopted from the firmware
++ Readout=1U<<2,   // pipe registers unreadable or power changed while reading
++ NoSource=1U<<3,  // the firmware's eDP SST source is no longer running
++ PipeOff=1U<<4,   // TRANSCONF not enabled and active
++ Timing=1U<<5,    // requested active size or source size differs from the pipe
++ Format=1U<<6,    // lane count or color depth differs
++ Sink=1U<<7,      // DPCD lane status not trained (recorded only)
++ Blanking=1U<<8,  // totals or sync positions differ (recorded only: the pipe
++                  // keeps the firmware's refresh of the same active image)
++};
++constexpr uint32_t Blocking=~uint32_t(Sink|Blanking);
++// Registers in Live/record order: TRANS_DDI_FUNC_CTL, TRANSCONF, then the six
++// timing words and PIPESRC.
++constexpr uint32_t LiveRegisters[]={0x60400,0x70008,0x60000,0x60004,0x60008,0x6000C,0x60010,0x60014,0x6001C};
++struct Live {uint32_t func,transconf,timing[6],source;};
++struct Wanted {uint32_t func,timing[6],source;};
++inline uint32_t field(const void *base,uint32_t offset) {
++ uint32_t v;__builtin_memcpy(&v,static_cast<const uint8_t *>(base)+offset,4);return v;
++}
++inline Wanted wanted(const void *params) {
++ Wanted w{};w.func=field(params,0x4);
++ for(unsigned i=0;i<6;++i)w.timing[i]=field(params,0x10+4*i);
++ w.source=field(params,0x28);return w;
++}
++// portLanes: the donor's AppleIntelPort +0x124 after setupClocks. The link
++// rate is not compared: the same-mode branch never touches the DPLL, the DDI
++// or the transcoder's M/N, so the pipe keeps the firmware's rate whatever the
++// donor computed (the IdeaPad's firmware leaves LINK_BW_SET 0x14 next to
++// LINK_RATE_SET 3; the donor picks HBR).
++inline uint32_t compare(const Live &live,const Wanted &want,uint32_t portLanes) {
++ uint32_t reasons=0;
++ if((live.transconf&0xC0000000U)!=0xC0000000U)reasons|=PipeOff;
++ // HTOTAL/VTOTAL bits 13:0 (12:0) hold the active size minus one.
++ if((live.timing[0]&0x3FFFU)!=(want.timing[0]&0x3FFFU) || (live.timing[3]&0x1FFFU)!=(want.timing[3]&0x1FFFU) ||
++    live.source!=want.source)reasons|=Timing;
++ for(unsigned i=0;i<6;++i)if(live.timing[i]!=want.timing[i])reasons|=Blanking;
++ const auto lanes=((live.func>>1)&7)+1;
++ if(lanes!=portLanes || ((want.func>>1)&7)+1!=lanes || ((live.func^want.func)&0x00700000U))reasons|=Format;
++ return reasons;
++}
++// DPCD 0x202..0x204: every active lane CR, EQ and symbol lock, aligned.
++inline bool sinkTrained(const uint8_t *status,uint32_t lanes) {
++ if(!status || !lanes || lanes>4)return false;
++ for(uint32_t n=0;n<lanes;++n)if(((status[n/2]>>(4*(n&1)))&7)!=7)return false;
++ return status[2]&1;
++}
++// The panel's receiver caps as the donor's getDPCDInfo and link setup read
++// them, capped at HBR: MAX_LINK_RATE in the receiver caps (0x001) and the
++// extended caps (0x2201), the eDP 1.4 SUPPORTED_LINK_RATES table (0x010, 200 kHz
++// units, ascending, 0 ends it; getDPCDInfo prefers its highest entry over
++// MAX_LINK_RATE) and the LINK_BW_SET the donor reads back and reuses (0x100).
++// At HBR setupOptimalLaneCount gives a 1920x1200@60 8 bpc mode the firmware's
++// two lanes (one at HBR2). Nothing is written to the sink.
++inline void capLinkCaps(uint32_t address,uint8_t *data,uint32_t length) {
++ if(!data || !length)return;
++ const auto at=[&](uint32_t reg)->uint8_t *{return reg>=address && reg-address<length ? data+(reg-address) : nullptr;};
++ const uint32_t rates[]={0x001U,0x2201U,0x100U};
++ for(const auto reg:rates)if(auto b=at(reg); b && *b>0x0AU)*b=0x0A;
++ for(uint32_t i=0;i<8;++i) {
++  auto lo=at(0x10+2*i),hi=at(0x11+2*i);
++  if(lo && hi && uint32_t(*lo|(*hi<<8))>13500U)*lo=*hi=0;
++ }
++}
++// The panel EDID's DisplayPort color depth (EDID 1.4 video input definition,
++// bits 6:4) reported as 8 bits per component when it says more, with the
++// checksum fixed, so AGDC policy, mode validation and the mode set agree on the
++// firmware's depth. Anything but a digital EDID 1.4 base block is unchanged.
++inline bool edid8bpc(uint8_t *edid) {
++ static const uint8_t header[]={0,255,255,255,255,255,255,0};
++ if(!edid || __builtin_memcmp(edid,header,sizeof(header)) || edid[18]!=1 || edid[19]<4 ||
++    !(edid[20]&0x80) || ((edid[20]>>4)&7)<=2)return false;
++ edid[20]=uint8_t((edid[20]&0x8F)|0x20);
++ uint32_t sum=0;for(unsigned i=0;i<127;++i)sum+=edid[i];
++ edid[127]=uint8_t(-sum);
++ return true;
++}
++}
++#endif
+diff --git a/WhateverXe/kern_xe.cpp b/WhateverXe/kern_xe.cpp
+index aaa0818..ed6cd77 100644
+--- a/WhateverXe/kern_xe.cpp
++++ b/WhateverXe/kern_xe.cpp
+@@ -52,6 +52,7 @@
+ #include "kern_adls_clock.hpp"
+ #include "kern_adls_boot.hpp"
+ #include "kern_tgl_combo_signal.hpp"
++#include "kern_display13_edp_keep.hpp"
+ #include "kern_tgl_panel_depth.hpp"
+ #include "kern_xelp_panel_power.hpp"
+ #include "kern_display13_panel.hpp"
+@@ -7284,12 +7285,34 @@ bool XE::display13AUXReady(void *port,bool command,bool retained) {
+  Display13FBPowerIO io {c.map};return c.bridge.beginAUXCommand(io,config[0]);
+ }
+ 
++// -wex-edp-keep: keep the firmware-trained panel link (kern_display13_edp_keep,
++// wrapDisplay13RegsNeedUpdate). The panel's receiver caps and EDID are seen
++// in the firmware's usual eDP format so the donor's mode set requests it.
++static bool display13EDPKeep() {
++ static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-keep") ? 1 : 0;
++ return v==1;
++}
++// WEXEDPKeepFirst / WEXEDPKeep, one record per complete mode set the donor
++// asked for on a display path while -wex-edp-keep is set (the first one, which
++// still sees the firmware's link, and the last one are published):
++//   version, call, kept (count of kept links), reasons (Display13EDPKeep::Reason),
++//   ddi, pipe, path state (+3644), port lanes (+124), port rate (+128, recorded
++//   only), live TRANS_DDI_FUNC_CTL/TRANSCONF/H,V timings/PIPESRC, requested
++//   TRANS_DDI_FUNC_CTL/timings/PIPESRC, DPCD 0x202..0x207.
++struct Display13EDPKeepRecord {
++ uint32_t version,call,kept,reasons,ddi,pipe,state,portLanes,portRate;
++ uint32_t live[9],wanted[8];uint8_t status[8];
++};
++static volatile uint32_t display13EDPKeepCalls=0,display13EDPKeepKept=0;
+ uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_t length) {
+  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
+  IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);IOLockUnlock(c.lock);
+  if(!ready)return kIOReturnNotReady;
+  const auto r=FunctionCast(wrapDisplay13ReadAUX,callbackXE->orgDisplay13ReadAUX)(port,address,data,length);
+- IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);IOLockUnlock(c.lock);
++ IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);
++ const auto ddi=complete ? Display13FBMemory::field<uint32_t>(port,0x120) : UINT32_MAX;
++ const bool panel=ddi<2 && (callbackXE->adlnOutputWiring.panel&(1U<<ddi));IOLockUnlock(c.lock);
++ if(!r && complete && panel && display13EDPKeep())Display13EDPKeep::capLinkCaps(address,static_cast<uint8_t *>(data),length);
+  return r ? r : complete ? 0 : kIOReturnNotReady;
+ }
+ uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32_t length) {
+@@ -7539,6 +7562,21 @@ bool XE::processDisplay13FramebufferSST(KernelPatcher &patcher,size_t index,mach
+   {disable,wrapDisplay13DisablePort,orgDisplay13DisablePort}
+  };
+  display13FBSSTHooksReady=patcher.routeMultiple(index,routes,arrsize(routes),address,size);patcher.clearError();
++ // -wex-edp-keep only: the mode-set decision (wrapDisplay13RegsNeedUpdate) at
++ // its Tahoe TGL framebuffer address. Its 17-byte prologue has no
++ // RIP-relative operand; a missing hook leaves the donor's own decision and
++ // the rest of the SST frontend unchanged.
++ if(display13FBSSTHooksReady && display13EDPKeep()) {
++  const char *regs="__ZN31AppleIntelFramebufferController16hwRegsNeedUpdateEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsPK29IODetailedTimingInformationV2PN16AppleIntelScaler12SCALERPARAMSE";
++  const uint8_t regsEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x18};
++  const auto u=patcher.solveSymbol<mach_vm_address_t>(index,regs,address,size);patcher.clearError();
++  bool ready=u==address+0x4F044 && !memcmp(reinterpret_cast<void *>(u),regsEntry,sizeof(regsEntry));
++  if(ready) {
++   KernelPatcher::RouteRequest route[] {{regs,wrapDisplay13RegsNeedUpdate,orgDisplay13RegsNeedUpdate}};
++   ready=patcher.routeMultiple(index,route,arrsize(route),address,size);patcher.clearError();
++  }
++  IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPKeepReady",ready);
++ }
+  return display13FBSSTHooksReady;
+ }
+ 
+@@ -7706,6 +7744,78 @@ uint32_t XE::wrapDisplay13TrainingPattern(void *path,uint32_t pattern) {
+  if(result || pattern>5)return result;
+  return program(false)?0:kIOReturnNotReady;
+ }
++
++// -wex-edp-keep (Display13EDPKeep): the donor asks for a complete mode set of
++// the boot panel path because its cached CRTCParams and current mode are the
++// boot placeholders, and that mode set stops the firmware's link and
++// retrains it. When the path is the one WhateverXe adopted at handoff, the
++// firmware's eDP SST source still runs (AlderLakeN::dpSource on a fresh
++// readout) and its pipe already has exactly the requested active image, lanes
++// and depth, report no register update: the donor's own same-mode branch then
++// updates only the plane and scaler (hwSetMode "Partial modeset"), leaves the
++// path attached (+3644 stays 2) and returns success. Anything else keeps the
++// donor's answer. The owner lock is held only for the register readout; the
++// DPCD status read runs after it.
++bool XE::wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler) {
++ auto s=callbackXE;auto &c=display13FBPower;
++ const bool update=FunctionCast(wrapDisplay13RegsNeedUpdate,s->orgDisplay13RegsNeedUpdate)(controller,fb,path,params,timing,scaler);
++ if(!update || !display13EDPKeep() || !c.lock || !path || !params)return update;
++ namespace K=Display13EDPKeep;
++ Display13EDPKeepRecord record {};record.version=1;record.call=__sync_add_and_fetch(&display13EDPKeepCalls,1);
++ record.ddi=record.pipe=record.state=UINT32_MAX;
++ uint32_t reasons=0,lanes=0;void *port=nullptr;
++ IOLockLock(c.lock);
++ auto object=static_cast<OSObject *>(path);
++ if(object->getMetaClass()->getClassSize()>=0x3730) {
++  port=Display13FBMemory::field<void *>(path,0x3648);
++  record.pipe=Display13FBMemory::field<uint32_t>(path,0x3640);record.state=Display13FBMemory::field<uint32_t>(path,0x3644);
++ }
++ // The panel's Combo port can still have the native mode 0 of the handoff:
++ // setPortMode runs in the donor's complete mode set, which a kept link skips.
++ auto p=port ? display13SSTPort(port) : nullptr;
++ if(!p && port)p=display13PanelBootPort(port);
++ if(p)record.ddi=Display13FBMemory::field<uint32_t>(p,0x120);
++ if(!p || controller!=c.controller || record.ddi>=2 || !(s->adlnOutputWiring.panel&(1U<<record.ddi)) || record.pipe!=0)reasons|=K::NotPanel;
++ else {
++  record.portLanes=Display13FBMemory::field<uint32_t>(p,0x124);record.portRate=Display13FBMemory::field<uint32_t>(p,0x128);
++  if(!c.bootPanel || c.bridge.bootPort!=record.ddi || !c.bridge.bootAdopted ||
++     c.bridge.bootPath!=reinterpret_cast<uintptr_t>(path))reasons|=K::NotBoot;
++  Display13FBBootIO io{c.map};auto &live=c.displayScratch;AlderLakeN::readDisplay(io,true,live);
++  uint32_t values[arrsize(K::LiveRegisters)] {};bool read=live.status==AlderLakeN::ReadoutStatus::Complete;
++  for(unsigned i=0;read && i<arrsize(K::LiveRegisters);++i)read=AlderLakeN::value(live,K::LiveRegisters[i],values[i]);
++  for(unsigned i=0;i<arrsize(K::LiveRegisters);++i)record.live[i]=values[i];
++  if(!read)reasons|=K::Readout;
++  else {
++   if(!AlderLakeN::dpSource(live,0,record.ddi,nullptr,true))reasons|=K::NoSource;
++   K::Live l {};l.func=values[0];l.transconf=values[1];
++   for(unsigned i=0;i<6;++i)l.timing[i]=values[2+i];
++   l.source=values[8];lanes=((l.func>>1)&7)+1;
++   reasons|=K::compare(l,K::wanted(params),record.portLanes);
++  }
++  const auto w=K::wanted(params);record.wanted[0]=w.func;
++  for(unsigned i=0;i<6;++i)record.wanted[1+i]=w.timing[i];
++  record.wanted[7]=w.source;
++ }
++ IOLockUnlock(c.lock);
++ if(!(reasons&K::NotPanel)) {
++  uint8_t status[6] {};
++  const auto r=wrapDisplay13ReadAUX(port,0x202,status,sizeof(status));
++  if(r || !K::sinkTrained(status,lanes))reasons|=K::Sink;
++  memcpy(record.status,status,sizeof(status));
++ }
++ record.reasons=reasons;
++ const bool keep=!(reasons&K::Blocking);
++ if(keep)record.kept=__sync_add_and_fetch(&display13EDPKeepKept,1);
++ else record.kept=display13EDPKeepKept;
++ auto root=IORegistryEntry::getRegistryRoot();
++ if(record.call==1)root->setProperty("WEXEDPKeepFirst",&record,sizeof(record));
++ root->setProperty("WEXEDPKeep",&record,sizeof(record));
++ if(keep && record.kept==1)
++  SYSLOG("igfx","eDP keep: firmware link kept on DDI %u, pipe A (sink status %02x %02x %02x)",record.ddi,record.status[0],record.status[1],record.status[2]);
++ else if(!keep && record.call==1)
++  SYSLOG("igfx","eDP keep: firmware link not kept (reasons 0x%x, state %u, sink status %02x %02x %02x)",reasons,record.state,record.status[0],record.status[1],record.status[2]);
++ return keep ? false : update;
++}
+ uint32_t XE::wrapDisplay13GMBus(IOService *controller,uint32_t bus,uint32_t speed,void *request) {
+     // Extending the donor's pin bound is not permission to use an arbitrary
+     // Type-C DDC bus. Only the retained controller's selected TMDS wiring
+@@ -8257,6 +8367,9 @@ uint32_t XE::wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,b
+     uint64_t r[8] {1,block,force,0,0,config ? config[0] : 9};
+     auto root=IORegistryEntry::getRegistryRoot();if(selected)root->setProperty("N97FBPortDDCEntry",r,sizeof(r));
+     const auto result=FunctionCast(wrapAlderLakeNPortDDC,callbackXE->orgAlderLakeNPortDDC)(port,block,data,force);r[3]=result;
++    // -wex-edp-keep: the panel EDID's depth as the firmware runs it (8 bpc).
++    if(!result && block==1 && selected && config && config[0]<2 &&
++       (callbackXE->adlnOutputWiring.panel&(1U<<config[0])) && display13EDPKeep())Display13EDPKeep::edid8bpc(data);
+     cachePanelDepth(port,block,data,result);
+     if(selected) {
+         if(!result && data && (block==1 || block==2)) {
+@@ -17305,8 +17418,10 @@ void XE::wrapTGLModeTiming(void *controller,void *fb,void *timing) {
+  auto port=*reinterpret_cast<void **>(path+0x3648);
+  const auto ddi=tglPanelDepthPort(port);if(ddi>1)return;
+  IOSimpleLockLock(tglAUXLock);
+- const auto maximum=tglPanelDepthCache[ddi].port==port ? tglPanelDepthCache[ddi].maximum : 0;
++ auto maximum=tglPanelDepthCache[ddi].port==port ? tglPanelDepthCache[ddi].maximum : 0;
+  IOSimpleLockUnlock(tglAUXLock);
++ // -wex-edp-keep: the mode set requests the firmware's 8 bpc on the panel.
++ if(display13EDPKeep() && (callbackXE->adlnOutputWiring.panel&(1U<<ddi)) && (!maximum || maximum>8))maximum=8;
+  const auto encoding=*reinterpret_cast<uint16_t *>(t+0x88);
+  auto &depth=*reinterpret_cast<uint16_t *>(t+0x8A);
+  const auto before=depth;
+diff --git a/WhateverXe/kern_xe.hpp b/WhateverXe/kern_xe.hpp
+index f0748ce..61ce804 100644
+--- a/WhateverXe/kern_xe.hpp
++++ b/WhateverXe/kern_xe.hpp
+@@ -199,6 +199,7 @@ private:
+  static uint32_t wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag);
+  static uint32_t wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,bool flag);
+  mach_vm_address_t orgDisplay13TrainingPattern {},orgDisplay13SignalLevels {};
++ mach_vm_address_t orgDisplay13RegsNeedUpdate {};
+  mach_vm_address_t orgDisplay13EnablePort {},orgDisplay13DisablePort {};
+  static bool display13MainLinkAUX(void *port,bool acquire,bool stopping=false);
+  static uint32_t wrapDisplay13EnablePort(void *port);
+@@ -219,6 +220,7 @@ private:
+  static uint8_t *display13PanelBootPort(void *port);
+  static bool display13HDMIPort(void *port);
+  static uint32_t wrapDisplay13TrainingPattern(void *path,uint32_t pattern);
++ static bool wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler);
+  static uint32_t wrapDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphasis,void *overrideConfig);
+ 	mach_vm_address_t xelpProviderProbe {},xelpProviderConfigureProbe {};
+  bool display13DPAltProbeReady {},display13DPProbeReady {},display13TCProbeReady {},display13TCDPProbeReady {},display13FBDPHooksReady {};
+diff --git a/tests/display13_aux.py b/tests/display13_aux.py
+index c64106d..9c1473a 100644
+--- a/tests/display13_aux.py
++++ b/tests/display13_aux.py
+@@ -10,9 +10,12 @@ functions='\n'.join(re.search(re.escape(sig)+r'.*?\n\}',s,re.S).group() for sig
+  'bool XE::display13AUXReady(', 'uint32_t XE::wrapDisplay13ReadAUX(', 'uint32_t XE::wrapDisplay13WriteAUX(',
+  'uint32_t XE::wrapDisplay13I2CAUX(', 'uint32_t XE::wrapDisplay13RunAUX('])
+ binding=re.search(r'static TGLFBBinding::Readout adlnInspectPathBinding\(.*?\n\}',s,re.S).group()
++# -wex-edp-keep switch and record (kern_xe.cpp) with their kernel imports stubbed.
++keep=s[s.index('// -wex-edp-keep: keep the firmware-trained panel link (kern_display13_edp_keep,'):s.index('uint32_t XE::wrapDisplay13ReadAUX(')]
++keep=(r/'tests/display13_edp_keep_stubs.hpp').read_text()+'\n'+keep
+ objects=(r/'tests/tgl_fb_binding.cpp').read_text().split('int main()')[0].replace('port[0x580]','port[0x700]')
+ base=(r/'tests/display13_sst_fixture.cpp').read_text().split('int main(')[0]
+-base=base.replace('// NATIVE_OBJECTS',objects).replace('// BINDING',binding).replace('// FUNCTIONS',functions)
++base=base.replace('// NATIVE_OBJECTS',objects).replace('// BINDING',binding).replace('// FUNCTIONS',keep+'\n'+functions)
+ base=base.replace('struct OSObject {','void *nativePortObject=nullptr;\nstruct OSObject {').replace('return size;','return this==nativePortObject?0x700:size;')
+ base=base.replace('bool adlnWriterMappingBound()', 'void adlnFault(bool &fault,unsigned){fault=true;}\nbool adlnWriterMappingBound()')
+ header=(r/'WhateverXe/kern_xe.hpp').read_text()
+diff --git a/tests/display13_edp_keep.cpp b/tests/display13_edp_keep.cpp
+new file mode 100644
+index 0000000..9c61ad0
+--- /dev/null
++++ b/tests/display13_edp_keep.cpp
+@@ -0,0 +1,123 @@
++// -wex-edp-keep: the firmware eDP link is kept only when its pipe runs exactly
++// the active image the donor requests over the same link format, and the
++// IdeaPad firmware's measured eDP state is a valid AlderLakeN::dpSource. The
++// receiver caps and EDID views make the donor request that format.
++#include "kern_alderlake_n.hpp"
++#include "kern_display13_edp_keep.hpp"
++#include <map>
++#include <cassert>
++#include <cstdio>
++#include <cstring>
++#include <utility>
++#include <vector>
++using namespace AlderLakeN;
++struct IO {
++    std::map<uint32_t,uint32_t> regs;
++    bool readable(uint32_t reg) {return reg<0x1000000;}
++    uint32_t read(uint32_t reg) {return regs[reg];}
++    void write(uint32_t reg,uint32_t v) {regs[reg]=v;}
++};
++// AppleIntelFramebufferController::SetupTimings for one EDID detailed timing.
++struct Mode {uint32_t ha,hb,hso,hsw,va,vb,vso,vsw;};
++static void setupTimings(const Mode &t,uint32_t out[6]) {
++    const uint32_t htotal=t.ha+t.hb,hstart=t.ha+t.hso,hend=hstart+t.hsw,vtotal=t.va+t.vb;
++    out[0]=(((htotal-1)<<16)&0x3FFF0000U)|((t.ha-1)&0x3FFFU);
++    out[1]=out[0];
++    out[2]=(((hend-1)<<16)&0x3FFF0000U)|((hstart-1)&0x3FFFU);
++    out[3]=(((vtotal-1)<<16)&0x1FFF0000U)|((t.va-1)&0x1FFFU);
++    out[4]=out[3];
++    const uint32_t vstart=(0x1FFFU+t.va+t.vso),vend=vstart+t.vsw;
++    out[5]=((vend<<16)&0x1FFF0000U)|(vstart&0x1FFFU);
++}
++// Samsung ATNA40CT01 EDID DTD: 154.25 MHz, 1920+160 x 1200+36, sync 48/32, 8/8.
++static const Mode panel {1920,160,48,32,1200,36,8,8};
++static IO firmware() {
++    uint32_t t[6];setupTimings(panel,t);
++    IO io;
++    io.regs={{0x45404,0xFC0F},{0x45454,3},{0x45444,1},{0x42000,0x8E380000},
++        {0x60400,0x8A010102},{0x60540,0x80040300},{0x64000,0x80000002},{0x46140,0x10000000},
++        {0x60030,0x7E5D159E},{0x60034,0x800000},{0x60040,0x7C1CD},{0x60044,0x80000},
++        {0x60000,t[0]},{0x60004,t[1]},{0x60008,t[2]},{0x6000C,t[3]},{0x60010,t[4]},{0x60014,t[5]},
++        {0x6001C,0x077F04AF},{0x70008,0xC0000000}};
++    return io;
++}
++// The donor's CRTCParams for the same mode: +0x4 TRANS_DDI_FUNC_CTL (enable,
++// DDI A, SST, positive hsync, x2), timings, PIPESRC.
++static void params(uint8_t *p,const Mode &t,uint32_t lanes=2,uint32_t bpc=0) {
++    memset(p,0,0x100);uint32_t timing[6];setupTimings(t,timing);
++    const uint32_t func=0x8A010000U|(bpc<<20)|((lanes-1)<<1),source=((t.ha-1)<<16)|(t.va-1);
++    memcpy(p+0x4,&func,4);memcpy(p+0x10,timing,sizeof(timing));memcpy(p+0x28,&source,4);
++}
++int main() {
++    using namespace Display13EDPKeep;
++    // The timing words match the register values the EDID DTD gives.
++    {uint32_t t[6];setupTimings(panel,t);
++     assert(t[0]==0x081F077F && t[2]==0x07CF07AF && t[3]==0x04D304AF && t[5]==0x04BF04B7);}
++    auto io=firmware();auto boot=readDisplay(io,true);
++    assert(boot.status==ReadoutStatus::Complete && boot.activePipes==1);
++    assert(dpSource(boot,0,0,nullptr,true));
++    uint32_t values[sizeof(LiveRegisters)/sizeof(LiveRegisters[0])];
++    for(unsigned i=0;i<sizeof(values)/sizeof(values[0]);++i)assert(value(boot,LiveRegisters[i],values[i]));
++    const auto liveOf=[&](const uint32_t *v){Live l{};l.func=v[0];l.transconf=v[1];for(unsigned i=0;i<6;++i)l.timing[i]=v[2+i];l.source=v[8];return l;};
++    const auto l=liveOf(values);
++    uint8_t p[0x100];
++    // Same mode, link and depth: kept.
++    params(p,panel);assert(compare(l,wanted(p),2)==0);
++    // Another refresh of the same image only records the blanking difference.
++    {Mode t=panel;t.vb=60;params(p,t);const auto r=compare(l,wanted(p),2);assert(r==Blanking && !(r&Blocking));}
++    {Mode t=panel;t.hso=40;params(p,t);assert(compare(l,wanted(p),2)==Blanking);}
++    // A different active image is never kept.
++    {Mode t=panel;t.ha=1680;t.hb=400;params(p,t);assert(compare(l,wanted(p),2)&Timing);}
++    {Mode t=panel;t.va=1050;t.vb=186;params(p,t);assert(compare(l,wanted(p),2)&Timing);}
++    {params(p,panel);uint32_t source=0x063F04AF;memcpy(p+0x28,&source,4);assert(compare(l,wanted(p),2)==Timing);}
++    // The firmware's 1024x768 GOP mode scaled to the panel (OpenCore Resolution
++    // below Max, as on the IdeaPad): the same-mode branch never rewrites PIPESRC.
++    {params(p,panel);auto scaled=l;scaled.source=0x03FF02FF;assert(compare(scaled,wanted(p),2)==Timing);}
++    // Lane count or depth the donor wants differ from the live link (the rate
++    // is never compared: the same-mode branch does not touch the link).
++    params(p,panel);
++    assert(compare(l,wanted(p),1)==Format);
++    params(p,panel,1);assert(compare(l,wanted(p),2)==Format);
++    params(p,panel,2,1);assert(compare(l,wanted(p),2)==Format);
++    // The pipe must be enabled and running.
++    {params(p,panel);auto off=l;off.transconf=0x80000000;assert(compare(off,wanted(p),2)==PipeOff);}
++    // A stopped or retrained source is not the firmware link any more.
++    for(auto change:{std::make_pair(0x64000U,0x00000082U),std::make_pair(0x60540U,0x80040000U),
++                     std::make_pair(0x60400U,0x0A010102U),std::make_pair(0x46140U,0U)}) {
++        auto stopped=firmware();stopped.regs[change.first]=change.second;
++        auto r=readDisplay(stopped,true);assert(!dpSource(r,0,0,nullptr,true));
++    }
++    // Every blocking reason blocks; the sink status and blanking never do.
++    assert((Blocking&(NotPanel|NotBoot|Readout|NoSource|PipeOff|Timing|Format))==(NotPanel|NotBoot|Readout|NoSource|PipeOff|Timing|Format));
++    assert(!(Blocking&(Sink|Blanking)));
++    // DPCD lane status: CR, EQ and symbol lock on every active lane, aligned.
++    {const uint8_t ok[6]={0x77,0x00,0x01,0,0,0},lane1[6]={0x07,0x00,0x01,0,0,0},open[6]={0x77,0x00,0x00,0,0,0};
++     assert(sinkTrained(ok,2) && sinkTrained(lane1,1) && !sinkTrained(lane1,2) && !sinkTrained(open,2));
++     const uint8_t four[6]={0x77,0x77,0x81,0,0,0};assert(sinkTrained(four,4) && !sinkTrained(four,0) && !sinkTrained(nullptr,2));}
++    // Receiver caps as the IdeaPad's Samsung ATNA40CT01 reports them (DPCD
++    // 0x000.., SUPPORTED_LINK_RATES up to 5.4 Gbps, firmware LINK_BW_SET 0x14):
++    // capped at HBR in every view the donor reads, other bytes unchanged.
++    {uint8_t caps[16]={0x14,0x14,0xc2,0xc1,0,0,1,0xc0,2,0,0,0,0x3f,0x09,0x80,0};const auto before=std::vector<uint8_t>(caps,caps+16);
++     capLinkCaps(0,caps,16);assert(caps[1]==0x0A);for(unsigned i=0;i<16;++i)if(i!=1)assert(caps[i]==before[i]);
++     uint8_t ext[4]={0x14,0x14,0xc2,0xc1};capLinkCaps(0x2200,ext,4);assert(ext[1]==0x0A && ext[0]==0x14);
++     uint8_t rates[16]={0xa4,0x1f,0x30,0x2a,0x76,0x2f,0xbc,0x34,0x48,0x3f,0x60,0x54,0x78,0x69,0,0};
++     capLinkCaps(0x10,rates,16);
++     const uint8_t capped[16]={0xa4,0x1f,0x30,0x2a,0x76,0x2f,0xbc,0x34,0,0,0,0,0,0,0,0};assert(!memcmp(rates,capped,16));
++     uint8_t bw[2]={0x14,0x82};capLinkCaps(0x100,bw,2);assert(bw[0]==0x0A && bw[1]==0x82);
++     uint8_t hbr[2]={0x0A,0x82};capLinkCaps(0x100,hbr,2);assert(hbr[0]==0x0A);
++     // A read that only partly covers a field caps what it covers.
++     uint8_t low[1]={0x60};capLinkCaps(0x1A,low,1);assert(low[0]==0x60);
++     uint8_t pair[2]={0x60,0x54};capLinkCaps(0x1A,pair,2);assert(!pair[0] && !pair[1]);
++     capLinkCaps(0,nullptr,16);}
++    // EDID 1.4 DisplayPort 10 bpc -> 8 bpc with a valid checksum; 8 bpc, 6 bpc,
++    // analog or non-EDID data unchanged.
++    {uint8_t edid[128]={0,255,255,255,255,255,255,0};edid[18]=1;edid[19]=4;edid[20]=0xB5;
++     uint32_t sum=0;for(unsigned i=0;i<127;++i)sum+=edid[i];edid[127]=uint8_t(-sum);
++     assert(edid8bpc(edid) && edid[20]==0xA5);sum=0;for(unsigned i=0;i<128;++i)sum+=edid[i];assert(!(sum&255));
++     assert(!edid8bpc(edid) && edid[20]==0xA5);
++     edid[20]=0x95;assert(!edid8bpc(edid) && edid[20]==0x95);
++     edid[20]=0x35;assert(!edid8bpc(edid));
++     edid[19]=3;edid[20]=0xB5;assert(!edid8bpc(edid));edid[19]=4;
++     edid[0]=1;assert(!edid8bpc(edid));assert(!edid8bpc(nullptr));}
++    printf("PASS Display13 eDP keep: firmware link kept only for the same active image and link format\n");
++}
+diff --git a/tests/display13_edp_keep_route.py b/tests/display13_edp_keep_route.py
+new file mode 100644
+index 0000000..825bc08
+--- /dev/null
++++ b/tests/display13_edp_keep_route.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++"""-wex-edp-keep through the production Display13 AUX wrappers and mode-set
++decision: the panel's receiver caps as the donor reads them, and the decision
++over a firmware-lit panel, with and without the switch. Optional exact donor
++replay of the hooked hwRegsNeedUpdate and its hwSetMode call site."""
++from pathlib import Path
++import re,subprocess,sys,tempfile
++r=Path(__file__).resolve().parents[1];s=(r/'WhateverXe/kern_xe.cpp').read_text()
++functions='\n'.join(re.search(re.escape(sig)+r'.*?\n\}',s,re.S).group() for sig in [
++ 'uint8_t *XE::display13SSTPort(', 'uint8_t *XE::display13PanelBootPort(', 'bool XE::display13HDMIPort(', 'bool XE::display13MainLinkAUX(',
++ 'uint32_t XE::wrapDisplay13EnablePort(', 'uint32_t XE::wrapDisplay13DisablePort(',
++ 'uint32_t XE::wrapDisplay13SignalLevels(', 'uint32_t XE::wrapDisplay13TrainingPattern(',
++ 'bool XE::display13AUXReady(', 'uint32_t XE::wrapDisplay13ReadAUX(', 'uint32_t XE::wrapDisplay13WriteAUX(',
++ 'bool XE::wrapDisplay13RegsNeedUpdate('])
++binding=re.search(r'static TGLFBBinding::Readout adlnInspectPathBinding\(.*?\n\}',s,re.S).group()
++keep=s[s.index('// -wex-edp-keep: keep the firmware-trained panel link (kern_display13_edp_keep,'):s.index('uint32_t XE::wrapDisplay13ReadAUX(')]
++keep=(r/'tests/display13_edp_keep_stubs.hpp').read_text()+'\n'+keep
++objects=(r/'tests/tgl_fb_binding.cpp').read_text().split('int main()')[0].replace('port[0x580]','port[0x700]')
++base=(r/'tests/display13_sst_fixture.cpp').read_text().split('int main(')[0]
++# The real context's boot readout and panel flag, read through the same
++# unpowered-safe boot IO (absent registers read 0).
++bootio='''struct Display13FBBootIO {
++ Map *map;explicit Display13FBBootIO(Map *m):map(m){}
++ bool readable(uint32_t r) const {return r<0x1000000;}
++ uint32_t read(uint32_t r){auto i=map->regs.find(r);return i==map->regs.end()?0:i->second;}
++};
++'''
++base=base.replace('// NATIVE_OBJECTS',objects).replace('// BINDING',binding).replace('// FUNCTIONS',bootio+keep+'\n'+functions)
++base=base.replace('bool adlnWriterMappingBound()','void adlnFault(bool &fault,unsigned){fault=true;}\nbool adlnWriterMappingBound()')
++base='#include "kern_alderlake_n.hpp"\n#include <cstdio>\n'+base
++assert base.count(' Map *map=nullptr;')==1
++base=base.replace(' Map *map=nullptr;',' Map *map=nullptr;bool bootPanel=false;AlderLakeN::DisplayReadout displayScratch;')
++header=(r/'WhateverXe/kern_xe.hpp').read_text()
++extra=header[header.index(' bool display13FBAUXHooksReady'):header.index(' mach_vm_address_t orgDisplay13TrainingPattern')]
++extra=extra.replace(' bool processDisplay13FramebufferAUX(KernelPatcher &,size_t,mach_vm_address_t,size_t);','').replace('mach_vm_address_t','uintptr_t')
++assert ' mach_vm_address_t orgDisplay13RegsNeedUpdate {};' in header and ' static bool wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler);' in header
++extra+=' uintptr_t orgDisplay13RegsNeedUpdate {};\n static bool wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler);\n'
++base=base.replace('struct XE {','struct XE {\n'+extra)
++code=base+(r/'tests/display13_edp_keep_route_fixture.cpp').read_text()
++if len(sys.argv)>1:
++ b=Path(sys.argv[1]).read_bytes()
++ install=s[s.index('bool XE::processDisplay13FramebufferSST('):s.index('uint8_t *XE::display13SSTPort(')]
++ entry=bytes(int(x,0) for x in re.search(r'regsEntry\[\]=\{([^}]+)\}',install).group(1).split(','))
++ assert 'u==address+0x4F044' in install and b[0x4F044:0x4F044+len(entry)]==entry
++ # hwSetMode: call hwRegsNeedUpdate, test al, je to the same-mode branch, whose
++ # two "Partial modeset" paths and "Complete modeset" are the donor's strings.
++ call=b[0x4FCA1:0x4FCAA]
++ assert call[0]==0xE8 and 0x4FCA6+int.from_bytes(call[1:5],'little',signed=True)==0x4F044 and call[5:8]==bytes.fromhex('84c074')
++ for text in [b'Partial modeset by updating plane',b'Partial modeset by updating scaler',b'Complete modeset']:assert text in b
++ print('PASS exact donor hwRegsNeedUpdate entry and hwSetMode same-mode branch')
++with tempfile.TemporaryDirectory(prefix='display13-edp-keep-') as d:
++ p=Path(d);(p/'test.cpp').write_text(code)
++ subprocess.run(['clang++','-std=c++17','-O1','-g','-fsanitize=address,undefined','-I'+str(r/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')],check=True)
++ for args in [[],['-wex-edp-keep']]:
++  subprocess.run([str(p/'test')]+args,check=True)
+diff --git a/tests/display13_edp_keep_route_fixture.cpp b/tests/display13_edp_keep_route_fixture.cpp
+new file mode 100644
+index 0000000..2e020b3
+--- /dev/null
++++ b/tests/display13_edp_keep_route_fixture.cpp
+@@ -0,0 +1,165 @@
++// -wex-edp-keep through the production wrappers: the donor's receiver-caps
++// reads (wrapDisplay13ReadAUX) and its mode-set decision
++// (wrapDisplay13RegsNeedUpdate) over the panel path the IdeaPad Slim 5
++// 14IAH8's firmware lit, with the real boot readout, AUX bridge and owner
++// lock, mock MMIO and a sink with the panel's measured DPCD.
++struct Sink {uint8_t dpcd[0x2300] {};bool trained=false;unsigned statusReads=0;} sink;
++unsigned sinkRead(void *,uint32_t address,void *data,uint32_t length){
++ assert(!locked);auto b=static_cast<uint8_t *>(data);
++ if(address<=0x202 && address+length>0x202)++sink.statusReads;
++ uint8_t status[6] {};if(sink.trained){status[0]=0x77;status[2]=0x01;}
++ for(uint32_t i=0;i<length;++i){const auto a=address+i;b[i]=a>=0x202 && a<0x208 ? status[a-0x202] : sink.dpcd[a];}
++ return 0;
++}
++// Neither the caps view nor the decision writes to the sink.
++unsigned sinkWrite(void *,uint32_t,void *,uint32_t){assert(false);return 0;}
++// Samsung ATNA40CT01 (WEXEDPDPCD and the Linux i915 DPCD dump): receiver caps,
++// SUPPORTED_LINK_RATES up to 5.4 Gbps, eDP 1.4b, and the link settings the
++// firmware leaves: LINK_BW_SET 0x14 next to LINK_RATE_SET 3, two lanes with
++// enhanced framing.
++void sinkReset(){
++ sink=Sink{};const uint8_t caps[16]={0x14,0x14,0xc2,0xc1,0,0,1,0xc0,2,0,0,0,0x3f,0x09,0x80,0};
++ memcpy(sink.dpcd,caps,16);memcpy(sink.dpcd+0x2200,caps,16);
++ const uint8_t rates[16]={0xa4,0x1f,0x30,0x2a,0x76,0x2f,0xbc,0x34,0x48,0x3f,0x60,0x54,0x78,0x69,0,0};
++ memcpy(sink.dpcd+0x10,rates,16);sink.dpcd[0x700]=0x05;sink.dpcd[0x701]=0xfd;sink.dpcd[0x702]=0xff;sink.dpcd[0x703]=0x02;
++ sink.dpcd[0x100]=0x14;sink.dpcd[0x101]=0x82;sink.dpcd[0x115]=3;sink.dpcd[0x10A]=0x80;sink.dpcd[0x600]=1;
++}
++void edpSetup(Fixture &f,Map &map){
++ setup(f,map,0,0,2,10,true);auto &c=display13FBPower;state.display13FBAUXHooksReady=true;
++ state.display13AUXControllerSlot=reinterpret_cast<uintptr_t>(&c.controller);put(f.ctl,0xC30,c.lock);
++ for(unsigned n=0;n<6;++n)put(f.port,0x594+4*n,0x64010U+4*n);
++ state.orgDisplay13ReadAUX=reinterpret_cast<uintptr_t>(sinkRead);state.orgDisplay13WriteAUX=reinterpret_cast<uintptr_t>(sinkWrite);
++ f.port[0x11A]=1;f.port[0x118]=0;put(f.port,0x550,1U);
++ for(auto reg:{0x60544U,0x70008U,0x164280U,0x46010U,0x46014U,0x164284U,0x164288U,0x16428CU,0x164290U,0xC7200U,0xC7204U})map.regs[reg]=0;
++ map.regs[0x64000]=0x80;sinkReset();
++}
++// getDPCDInfo and the link setup read the receiver caps, the extended caps,
++// the rate table and the LINK_BW_SET they reuse. Under -wex-edp-keep every view
++// is capped at HBR; otherwise the panel's values pass unchanged.
++void capsScenarios(bool keep){
++ Fixture f(0,0,0);Map map;edpSetup(f,map);
++ uint8_t caps[16],ext[16],rates[16],bw[2];
++ assert(!XE::wrapDisplay13ReadAUX(f.port,0,caps,16) && !XE::wrapDisplay13ReadAUX(f.port,0x2200,ext,16));
++ assert(!XE::wrapDisplay13ReadAUX(f.port,0x10,rates,16) && !XE::wrapDisplay13ReadAUX(f.port,0x100,bw,2));
++ assert(caps[1]==(keep?0x0A:0x14) && ext[1]==(keep?0x0A:0x14) && bw[0]==(keep?0x0A:0x14) && bw[1]==0x82);
++ for(unsigned i=0;i<16;++i)if(i!=1)assert(caps[i]==sink.dpcd[i] && ext[i]==sink.dpcd[0x2200+i]);
++ for(unsigned i=0;i<16;++i)assert(rates[i]==(keep && i>=8 ? 0 : sink.dpcd[0x10+i]));
++ // Only the donor's view changes: the sink keeps its own values.
++ assert(sink.dpcd[0x1]==0x14 && sink.dpcd[0x100]==0x14);
++ assert(objectRefs.empty());
++}
++// The panel path the firmware lit: pipe A -> DDI A eDP SST x2, 8 bpc,
++// 1920x1200 from the panel's EDID DTD (154.25 MHz, 1920+160 x 1200+36, sync
++// 48/32, 8/8), and the donor's CRTCParams for the same mode.
++struct KeepMode {uint32_t ha,hb,hso,hsw,va,vb,vso,vsw;};
++const KeepMode keepPanel {1920,160,48,32,1200,36,8,8};
++void keepTimings(const KeepMode &t,uint32_t out[6]) {
++ const uint32_t htotal=t.ha+t.hb,hstart=t.ha+t.hso,hend=hstart+t.hsw,vtotal=t.va+t.vb;
++ out[0]=out[1]=(((htotal-1)<<16)&0x3FFF0000U)|((t.ha-1)&0x3FFFU);
++ out[2]=(((hend-1)<<16)&0x3FFF0000U)|((hstart-1)&0x3FFFU);
++ out[3]=out[4]=(((vtotal-1)<<16)&0x1FFF0000U)|((t.va-1)&0x1FFFU);
++ const uint32_t vstart=0x1FFFU+t.va+t.vso,vend=vstart+t.vsw;
++ out[5]=((vend<<16)&0x1FFF0000U)|(vstart&0x1FFFU);
++}
++void firmwareLink(Map &map,const KeepMode &m) {
++ uint32_t t[6];keepTimings(m,t);
++ map.regs[0x45404]|=0x400; // PW_A state
++ const std::pair<uint32_t,uint32_t> regs[]={{0x60400,0x8A010102},{0x60540,0x80040300},{0x64000,0x80000002},
++  {0x46140,0x10000000},{0x60030,0x7E5D159E},{0x60034,0x800000},{0x60040,0x7C1CD},{0x60044,0x80000},
++  {0x60000,t[0]},{0x60004,t[1]},{0x60008,t[2]},{0x6000C,t[3]},{0x60010,t[4]},{0x60014,t[5]},
++  {0x6001C,0x077F04AF},{0x70008,0xC0000000}};
++ for(const auto &r:regs)map.regs[r.first]=r.second;
++}
++void keepParams(uint8_t *p,const KeepMode &m,uint32_t lanes=2,uint32_t bpc=0) {
++ memset(p,0,0x100);uint32_t timing[6];keepTimings(m,timing);
++ const uint32_t func=0x8A010000U|(bpc<<20)|((lanes-1)<<1),source=((m.ha-1)<<16)|(m.va-1);
++ memcpy(p+0x4,&func,4);memcpy(p+0x10,timing,sizeof(timing));memcpy(p+0x28,&source,4);
++}
++unsigned regsCalls=0;bool regsResult=true;
++bool nativeRegs(void *,void *,void *,void *,const void *,void *){assert(!locked);++regsCalls;return regsResult;}
++struct KeepResult {bool update=true,recorded=false;uint32_t reasons=0,kept=0,call=0,portLanes=0,portRate=0;unsigned statusReads=0;size_t writes=0;};
++template<class Change> KeepResult keepCase(Change change) {
++ Fixture f(0,0,0);Map map;edpSetup(f,map);auto &c=display13FBPower;
++ state.orgDisplay13RegsNeedUpdate=reinterpret_cast<uintptr_t>(nativeRegs);regsResult=true;
++ firmwareLink(map,keepPanel);sink.trained=true;
++ // WhateverXe adopted this boot path from the firmware (N97FBBootHandoff).
++ c.bootPanel=true;c.bridge.bootPort=0;c.bridge.bootPath=reinterpret_cast<uintptr_t>(f.path);c.bridge.bootAdopted=true;
++ uint8_t params[0x100];keepParams(params,keepPanel);
++ change(f,map,params);
++ auto &data=IORegistryEntry::getRegistryRoot()->data;data.erase("WEXEDPKeep");
++ const size_t writes=map.writes.size();const unsigned reads=sink.statusReads,calls=regsCalls;
++ KeepResult r;r.update=XE::wrapDisplay13RegsNeedUpdate(f.ctl,f.fb,f.path,params,nullptr,nullptr);
++ assert(regsCalls==calls+1 && !locked);
++ r.writes=map.writes.size()-writes;r.statusReads=sink.statusReads-reads;
++ if(data.count("WEXEDPKeep")) {
++  const auto &v=data["WEXEDPKeep"];assert(v.size()==sizeof(Display13EDPKeepRecord));
++  Display13EDPKeepRecord record;memcpy(&record,v.data(),sizeof(record));
++  r.recorded=true;r.reasons=record.reasons;r.kept=record.kept;r.call=record.call;r.portLanes=record.portLanes;r.portRate=record.portRate;
++ }
++ assert(objectRefs.empty());
++ return r;
++}
++Display13EDPKeepRecord firstRecord() {
++ auto &data=IORegistryEntry::getRegistryRoot()->data;
++ assert(data.count("WEXEDPKeepFirst"));const auto &v=data["WEXEDPKeepFirst"];assert(v.size()==sizeof(Display13EDPKeepRecord));
++ Display13EDPKeepRecord record;memcpy(&record,v.data(),sizeof(record));return record;
++}
++void keepScenarios() {
++ namespace K=Display13EDPKeep;unsigned scenarios=0;
++ const auto none=[](Fixture &,Map &,uint8_t *){};
++ // 1. The firmware's link runs the requested mode: no complete mode set, no
++ //    register write, one DPCD status read outside the owner lock. The donor's
++ //    rate (HBR) and the firmware's LINK_BW_SET (0x14) differ, as on the
++ //    IdeaPad, and do not matter: the link is not touched.
++ {auto r=keepCase(none);assert(!r.update && r.recorded && !r.reasons && r.kept==1 && !r.writes && r.statusReads==1);
++  assert(r.call==1 && r.portLanes==2 && r.portRate==0x0A);
++  const auto f=firstRecord();assert(f.call==1 && f.kept==1 && !f.reasons && f.ddi==0 && !f.pipe);
++  assert(testSyslog().size()==1 && strstr(testSyslog()[0].c_str(),"firmware link kept"));++scenarios;}
++ // The panel's Combo port before setPortMode (native mode 0, the handoff's
++ // terms in display13PanelBootPort) is the same panel; any other mode is not.
++ {auto r=keepCase([](Fixture &f,Map &,uint8_t *){put(f.port,0x550,0U);});assert(!r.update && !r.reasons && r.kept==2);++scenarios;}
++ {auto r=keepCase([](Fixture &f,Map &,uint8_t *){put(f.port,0x550,2U);});assert(r.update && r.reasons==K::NotPanel && !r.statusReads);++scenarios;}
++ // 2. Recorded only: an untrained sink status, another refresh of the same image.
++ {auto r=keepCase([](Fixture &,Map &,uint8_t *){sink.trained=false;});assert(!r.update && r.reasons==K::Sink && r.kept==3);++scenarios;}
++ {auto r=keepCase([](Fixture &,Map &,uint8_t *p){KeepMode m=keepPanel;m.vb=60;keepParams(p,m);});
++  assert(!r.update && r.reasons==K::Blanking);++scenarios;}
++ // 3. Never kept: a stopped or retrained source, another image, a scaled GOP
++ //    mode, another lane count or depth, a path WhateverXe did not adopt, a
++ //    pipe that is off.
++ {auto r=keepCase([](Fixture &,Map &map,uint8_t *){map.regs[0x64000]=0x82;});assert(r.update && (r.reasons&K::NoSource) && !r.writes);++scenarios;}
++ {auto r=keepCase([](Fixture &,Map &map,uint8_t *){map.regs[0x60540]=0x80040000;});assert(r.update && (r.reasons&K::NoSource));++scenarios;}
++ {auto r=keepCase([](Fixture &,Map &,uint8_t *p){KeepMode m=keepPanel;m.ha=1680;m.hb=400;keepParams(p,m);});assert(r.update && (r.reasons&K::Timing));++scenarios;}
++ {auto r=keepCase([](Fixture &,Map &map,uint8_t *){map.regs[0x6001C]=0x03FF02FF;});assert(r.update && r.reasons==K::Timing);++scenarios;}
++ {auto r=keepCase([](Fixture &,Map &,uint8_t *p){keepParams(p,keepPanel,1);});assert(r.update && r.reasons==K::Format);++scenarios;}
++ {auto r=keepCase([](Fixture &,Map &,uint8_t *p){keepParams(p,keepPanel,2,1);});assert(r.update && r.reasons==K::Format);++scenarios;}
++ {auto r=keepCase([](Fixture &f,Map &,uint8_t *){put(f.port,0x124,1U);});assert(r.update && r.reasons==K::Format);++scenarios;}
++ {auto r=keepCase([](Fixture &,Map &,uint8_t *){display13FBPower.bridge.bootPath=1;});assert(r.update && r.reasons==K::NotBoot);++scenarios;}
++ {auto r=keepCase([](Fixture &,Map &,uint8_t *){display13FBPower.bootPanel=false;});assert(r.update && r.reasons==K::NotBoot);++scenarios;}
++ {auto r=keepCase([](Fixture &,Map &,uint8_t *){display13FBPower.bridge.bootAdopted=false;});assert(r.update && r.reasons==K::NotBoot);++scenarios;}
++ {auto r=keepCase([](Fixture &,Map &map,uint8_t *){map.regs[0x70008]=0x80000000;});assert(r.update && (r.reasons&K::PipeOff));++scenarios;}
++ // 4. Not the panel's pipe A: no readout, no AUX.
++ {auto r=keepCase([](Fixture &f,Map &,uint8_t *){put(f.path,0x3640,1U);});assert(r.update && r.reasons==K::NotPanel && !r.statusReads);++scenarios;}
++ // 5. The donor already found nothing to update: untouched, unrecorded.
++ {auto r=keepCase([](Fixture &,Map &,uint8_t *){regsResult=false;});assert(!r.update && !r.recorded && !r.statusReads);++scenarios;}
++ // The first decision stays published next to the last one, and only the
++ // first kept link is logged.
++ {const auto f=firstRecord();assert(f.call==1 && !f.reasons);assert(testSyslog().size()==1);}
++ printf("PASS Display13 eDP keep: %u mode-set decisions over a firmware-lit panel through the production wrappers\n",scenarios);
++}
++// Without -wex-edp-keep the decision is the donor's, unrecorded.
++void offScenario() {
++ Fixture f(0,0,0);Map map;edpSetup(f,map);
++ state.orgDisplay13RegsNeedUpdate=reinterpret_cast<uintptr_t>(nativeRegs);regsResult=true;firmwareLink(map,keepPanel);sink.trained=true;
++ auto &c=display13FBPower;c.bootPanel=true;c.bridge.bootPort=0;c.bridge.bootPath=reinterpret_cast<uintptr_t>(f.path);c.bridge.bootAdopted=true;
++ uint8_t params[0x100];keepParams(params,keepPanel);const unsigned reads=sink.statusReads;
++ assert(XE::wrapDisplay13RegsNeedUpdate(f.ctl,f.fb,f.path,params,nullptr,nullptr) && sink.statusReads==reads);
++ assert(!IORegistryEntry::getRegistryRoot()->data.count("WEXEDPKeep") && testSyslog().empty());
++ printf("PASS Display13 eDP keep off: the donor's caps and mode-set decision unchanged\n");
++}
++int main(int argc,char **argv){
++ for(int i=1;i<argc;++i)testKernelArguments().insert(argv[i]);
++ const bool keep=testKernelArguments().count("-wex-edp-keep")!=0;
++ capsScenarios(keep);
++ if(keep)keepScenarios();else offScenario();
++ return 0;
++}
+diff --git a/tests/display13_edp_keep_stubs.hpp b/tests/display13_edp_keep_stubs.hpp
+new file mode 100644
+index 0000000..0983825
+--- /dev/null
++++ b/tests/display13_edp_keep_stubs.hpp
+@@ -0,0 +1,30 @@
++// Kernel imports of kern_xe.cpp's -wex-edp-keep code for the extracted
++// Display13 AUX/SST wrapper fixtures. Boot arguments are test-controlled and
++// registry properties keep their bytes.
++#ifndef DISPLAY13_EDP_KEEP_STUBS_HPP
++#define DISPLAY13_EDP_KEEP_STUBS_HPP
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <map>
++#include <set>
++#include <string>
++#include <vector>
++#include "kern_display13_edp_keep.hpp"
++inline std::set<std::string> &testKernelArguments() {static std::set<std::string> a;return a;}
++inline bool checkKernelArgument(const char *name) {return testKernelArguments().count(name)!=0;}
++struct TestRegistryRoot {
++ unsigned published=0;
++ std::map<std::string,std::vector<uint8_t>> data;
++ template<class... T> bool setProperty(const char *,T...) {++published;return true;}
++ template<class P,class N> bool setProperty(const char *key,P *bytes,N length) {
++  ++published;auto b=reinterpret_cast<const uint8_t *>(bytes);data[key].assign(b,b+length);return true;
++ }
++};
++struct IORegistryEntry {static TestRegistryRoot *getRegistryRoot() {static TestRegistryRoot root;return &root;}};
++inline std::vector<std::string> &testSyslog() {static std::vector<std::string> l;return l;}
++#ifndef SYSLOG
++#define SYSLOG(module,fmt,...) testSyslog().push_back(fmt)
++#endif
++template<class T,size_t N> constexpr size_t arrsize(const T (&)[N]) {return N;}
++#endif
+diff --git a/tests/fixtures/boot_argument_names.json b/tests/fixtures/boot_argument_names.json
+index 9bef982..c7aac0a 100644
+--- a/tests/fixtures/boot_argument_names.json
++++ b/tests/fixtures/boot_argument_names.json
+@@ -146,6 +146,7 @@
+   "-wex-adlp-readout": [],
+   "-wex-adlp-load-only": [],
+   "-wex-display13-offline": [],
++  "-wex-edp-keep": [],
+   "-wex-dsi-hdmi-test": [],
+   "-wex-dsi-power-test": []
+ }
+diff --git a/tests/tgl_panel_depth_route.py b/tests/tgl_panel_depth_route.py
+index 4c5dcc1..a6dae27 100644
+--- a/tests/tgl_panel_depth_route.py
++++ b/tests/tgl_panel_depth_route.py
+@@ -57,6 +57,7 @@ struct XE {
+ struct TGLPanelDepthCache {void *port;uint32_t maximum;};
+ TGLPanelDepthCache tglPanelDepthCache[2];
+ #define FunctionCast(f,p) reinterpret_cast<decltype(&f)>(p)
++bool keepArg=false;static bool display13EDPKeep(){return keepArg;}
+ PRODUCTION
+ void native(void *,void *,void *){++calls;}
+ template<class T> void put(uint8_t *p,unsigned off,T v){memcpy(p+off,&v,sizeof(v));}
+@@ -90,6 +91,16 @@ int main(){
+  XE::wrapTGLModeTiming(nullptr,fb,timing);assert(published==before+1 && *reinterpret_cast<uint16_t*>(timing+0x8A)==1);
+  state.adlsWiring.panel=0;put(timing,0x8A,uint16_t(2));before=published;
+  XE::wrapTGLModeTiming(nullptr,fb,timing);assert(published==before && *reinterpret_cast<uint16_t*>(timing+0x8A)==2);
++ // -wex-edp-keep: the panel's mode set requests the firmware's 8 bpc, only on the
++ // panel DDI; without the switch the EDID maximum stands.
++ state.adlsDisplaySelected=false;state.xeProfile.family=XELP::Family::TigerLake;put(port,0x548,static_cast<void *>(cfg));
++ cfg[0]=cfg[2]=0;tglPanelDepthCache[0]={port,10};
++ for(unsigned test=0;test<3;++test){
++  keepArg=test!=0;state.adlnOutputWiring.panel=test==2?2:1;put(timing,0x8A,uint16_t(4));
++  XE::wrapTGLModeTiming(nullptr,fb,timing);
++  assert(*reinterpret_cast<uint16_t *>(timing+0x8A)==(test==1?2:4) && record[1]==(test==1?8U:10U));
++ }
++ keepArg=false;
+  puts("PASS: production owner/port guards and unused-controller argument");
+ }
+ '''.replace('PRODUCTION',s[start:end])
+diff --git a/tools/test.py b/tools/test.py
+index 9552458..23354a4 100644
+--- a/tools/test.py
++++ b/tools/test.py
+@@ -10,10 +10,11 @@ jobs=[(p.stem,['clang++','-std=c++17','-O1','-g','-fsanitize=address,undefined',
+ python_tests += ['tgl_power_fuses', 'display13_boot_aux', 'display13_aux', 'display13_sst', 'display13_combo_clock', 'adls_panel_pwm', 'display13_panel_runtime', 'tgl_panel_timing', 'backlight_adapter', 'tgl_panel_power', 'tgl_edp_transcoder', 'tgl_training_pattern', 'tgl_combo_pll_write', 'tgl_sink_framing', 'tgl_combo_aux_gate', 'tgl_combo_signal_guard', 'tgl_combo_aux_lifetime', 'tgl_iosurface_compression', 'tgl_panel_depth_route', 'display13_tiling']
+ python_tests += ['display13_cursor_resize','dsi_presentation','dsi_native_mode','dsi_backing_adapter','dsi_update_dispatch','dsi_path_disposal','dsi_clock','dsi_quiesce_adapter','dsi_quiesce','dsi_surface','dsi_ggtt','dsi_lifecycle_dispatch','dsi_boot_adoption','dsi_native_cache','dsi_boot_probe','dsi_resources','dsi_boot_adapter','dsi_port_adapter','dsi_apple_adapter','fatal_log_storage','boot_stack_limits','xelp_combo_clock_guard','display13_tc_preparation','display13_tc_disconnect','display13_dbuf_setup','display13_retirement','display13_trial_retirement','display13_port_wait','display13_agdc','display13_training_frontend','framebuffer_donor_runtime','compat_bundle_version']
+ python_tests += ['dsi_backlight_adapter','dsi_restart','dsi_panel','dsi_command_adapter','dsi_irq_live','dsi_surface_adapter','dsi_aperture_adapter']
+-python_tests += ['display13_shutdown']
++python_tests += ['display13_shutdown','display13_edp_keep_route']
+ jobs += [(n,[sys.executable,str(R/'tests'/(n+'.py'))],None) for n in python_tests]
+ if a.donor:jobs += [('display13_agdc_native',[sys.executable,str(R/'tests/display13_agdc.py'),str(a.donor.resolve())],None)]
+ if a.donor:jobs += [('display13_shutdown_native',[sys.executable,str(R/'tests/display13_shutdown.py'),str(a.donor.resolve())],None)]
++if a.donor:jobs += [('display13_edp_keep_route_native',[sys.executable,str(R/'tests/display13_edp_keep_route.py'),str(a.donor.resolve())],None)]
+ if a.donor:jobs += [('dsi_update_dispatch_native',[sys.executable,str(R/'tests/dsi_update_dispatch.py'),str(a.donor.resolve())],None)]
+ if a.donor:jobs += [('dsi_path_disposal_native',[sys.executable,str(R/'tests/dsi_path_disposal.py'),str(a.donor.resolve())],None)]
+ if a.donor:jobs += [('dsi_surface_native',[sys.executable,str(R/'tests/dsi_surface.py'),str(a.donor.resolve())],None)]
+-- 
+2.50.1 (Apple Git-155)
+

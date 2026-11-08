@@ -1,0 +1,87 @@
+From a7459cbfdfa8c1abebbf80fb294c9603460be975 Mon Sep 17 00:00:00 2001
+From: thatisjigen <55486333+Thatisjigen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:11:05 +0100
+Subject: [PATCH 09/11] Display13 WM: plan a primary at no more than twice
+ CDCLK
+
+The native rate of a primary multiplies the pipe scaler's ratio by its plane
+scaler's. A plane scaler left on by an earlier partial modeset, behind a pipe
+scaler already scaling, counts the downscale twice: 3403 MHz for 3200x1800 at
+180 Hz. level() gives up at 2 GHz, watermarkFaulted latches, and with it every
+output that has not started yet stays dark until the next boot. A plane fetches
+no more than twice CDCLK, so plan for that.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ WhateverXe/kern_display13_wm.hpp          |  5 +++++
+ WhateverXe/kern_xe.cpp                    |  2 +-
+ tests/display13_cursor_resize_fixture.cpp |  1 +
+ tests/display13_wm.cpp                    | 11 +++++++++++
+ 4 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/WhateverXe/kern_display13_wm.hpp b/WhateverXe/kern_display13_wm.hpp
+index 3183bde..212de81 100644
+--- a/WhateverXe/kern_display13_wm.hpp
++++ b/WhateverXe/kern_display13_wm.hpp
+@@ -192,6 +192,11 @@ inline Level transition(Level wm0,uint32_t allocation,bool ipc,uint32_t yTileMin
+     if(blocks>4095 || minimum>allocation)return l;
+     l.blocks=blocks;l.minimum=minimum;l.enable=true;return l;
+ }
++// The native rate of a primary multiplies the pipe scaler's ratio by its plane scaler's. A plane scaler
++// left on by an earlier partial modeset, behind a pipe scaler already scaling, would count the downscale
++// twice: 3403 MHz for 3200x1800 at 180 Hz. level() gives up at 2 GHz and the owner would fault for good,
++// and with it every output that has not started yet. No plane fetches above twice CDCLK: plan for that.
++inline uint64_t planePixelHz(uint64_t adjusted,uint64_t nativeHz) {return nativeHz && adjusted>nativeHz ? nativeHz : adjusted;}
+ inline Plan plan(uint32_t width,uint32_t htotal,uint64_t pixelHz,uint32_t allocation,const Latency &latency,bool ipc,bool yTiled=false,uint32_t height=0) {
+     Plan p;p.height=height;p.width=width;p.htotal=htotal;p.pixelHz=pixelHz;p.allocation=allocation;p.yTiled=yTiled;
+     if(latency.status!=Status::Complete)return p;
+diff --git a/WhateverXe/kern_xe.cpp b/WhateverXe/kern_xe.cpp
+index 4d126c9..f3a9fd2 100644
+--- a/WhateverXe/kern_xe.cpp
++++ b/WhateverXe/kern_xe.cpp
+@@ -9518,7 +9518,7 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
+ 			// Audited native pixel/scaling calculation is CPU-only. Preserve its
+ 			// path frequency and downscale behavior rather than assuming FHD Hz.
+ 			auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(callbackXE->adlnAdjustPixelClock);
+-			const auto pixel=adjust(c.controller,fb,path,cursor,nullptr);
++			const auto pixel=Display13WM::planePixelHz(adjust(c.controller,fb,path,cursor,nullptr),c.clock.nativeHz());
+ 			p=Display13WM::plan(width,htotal,pixel,range.end-range.start,c.latency,(ipc&8) || Display13FBMemory::field<uint8_t>(c.controller,0x1B4C),yTiled,cursor ? width : ((Display13FBMemory::field<uint32_t>(plane,0x11C)>>16)&0x1FFF)+1);
+ 			if(p.status==Display13WM::Status::Complete) {
+ 				auto object=reinterpret_cast<uint8_t *>(plane);
+diff --git a/tests/display13_cursor_resize_fixture.cpp b/tests/display13_cursor_resize_fixture.cpp
+index 3bb1f58..a2b7fda 100644
+--- a/tests/display13_cursor_resize_fixture.cpp
++++ b/tests/display13_cursor_resize_fixture.cpp
+@@ -28,6 +28,7 @@ struct Power {
+  bool engineEnabled{},clockFaulted{},memoryFaulted{},watermarkFaulted{};
+  struct {struct {bool faulted{};}state;}bridge;
+  Display13DBUF::State dbuf;Display13WM::Latency latency;Pipe pipe[3];
++ struct {uint64_t nativeHz() const {return 1305600000;}} clock;
+ }display13FBPower;
+ struct IORegistryEntry {
+  std::map<std::string,std::vector<uint8_t>> records;
+diff --git a/tests/display13_wm.cpp b/tests/display13_wm.cpp
+index 80a830c..4c536b4 100644
+--- a/tests/display13_wm.cpp
++++ b/tests/display13_wm.cpp
+@@ -336,6 +336,17 @@ int main() {
+     auto backPlan=committed.snapshot(nativePrimary,&staleCursor);
+     backPlan.pipePixelHz=441050000;backPlan.pipeLineTime=pipeLineTime(nativePrimary.htotal,backPlan.pipePixelHz);
+     assert(clockFits(backPlan,1305600000) && !clockFits(backPlan,784000000-1));
++    // A plane scaler left on behind the pipe scaler counts the downscale twice:
++    // above level()'s limit the plan fails and the owner would fault; at twice CDCLK it holds, and fits.
++    const uint64_t doubled=uint64_t(441050000)*25/9*25/9;
++    assert(doubled>2000000000ULL && plan(3200,2080,doubled,1952,latency,false,true,1800).status==Status::WM0);
++    assert(planePixelHz(doubled,1305600000)==1305600000 && planePixelHz(1225138888,1305600000)==1225138888);
++    assert(planePixelHz(doubled,0)==doubled);
++    auto heldPrimary=plan(3200,2080,planePixelHz(doubled,1305600000),1952,latency,false,true,1800);
++    assert(heldPrimary.status==Status::Complete && heldPrimary.sagv.enable);
++    auto heldPlan=committed.snapshot(heldPrimary,nullptr);
++    heldPlan.pipePixelHz=441050000;heldPlan.pipeLineTime=pipeLineTime(heldPrimary.htotal,heldPlan.pipePixelHz);
++    assert(clockFits(heldPlan,1305600000));
+     LatchIO afterCrawl(p);afterCrawl.clock=1305600000;
+     assert(latch(afterCrawl,afterCrawl.snapshot(p)).status==Status::Complete && afterCrawl.writes.empty());
+     LatchIO sameFrame(p);sameFrame.frozen=true;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,85 @@
+From 7d697daf31e127d9f44917d614af8266adbc22b9 Mon Sep 17 00:00:00 2001
+From: thatisjigen <55486333+Thatisjigen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:10:48 +0100
+Subject: [PATCH 08/11] Display13 WM: a primary and cursor behind the pipe
+ scaler fit up to twice CDCLK
+
+clockFits required them within CDCLK, which refuses HiDPI sizes at a high
+refresh rate: 1280x720 at scale 2 on a 441 MHz panel is charged 784 MHz. The
+native AppleIntelScaler::isSupportedByScaler admits such a mode up to twice
+CDCLK, the two pixels per CDCLK of i915's intel_crtc_compute_min_cdclk. The
+pipe's own clock stays within CDCLK and native-size modes keep the old limit.
+
+Each consumer takes the limit of what it is. A cursor's plan is rebuilt only
+when the cursor changes, so back at native size it still carries the scaled
+rate. Its programmed values are then the conservative ones, and refusing them
+would latch watermarkFaulted until the next boot.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ WhateverXe/kern_display13_wm.hpp | 15 +++++++++++----
+ tests/display13_wm.cpp           | 17 +++++++++++++++++
+ 2 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/WhateverXe/kern_display13_wm.hpp b/WhateverXe/kern_display13_wm.hpp
+index 8c1b55d..3183bde 100644
+--- a/WhateverXe/kern_display13_wm.hpp
++++ b/WhateverXe/kern_display13_wm.hpp
+@@ -288,12 +288,19 @@ inline TriggerSurfaces triggerSurfaces(const TriggerPacket *packets,uint32_t cou
+ // These linear RGB/cursor WM and PIPE_WM_LINETIME equations do not consume
+ // CDCLK. An unchanged hardware-verified plan is valid at another clock when
+ // every consumer still fits its bandwidth. A clock request alone is no proof.
++// nativeHz is twice CDCLK. A pipe's own clock stays within CDCLK. A pipe scaler
++// charges its primary and cursor the downscale on top; the native
++// AppleIntelScaler::isSupportedByScaler admits such a mode up to nativeHz, which
++// is the two pixels per CDCLK of i915's intel_crtc_compute_min_cdclk.
++// Judge each consumer on its own: a cursor's plan is rebuilt only when the cursor
++// changes, so back at native size it can still carry the scaled rate. Its programmed
++// values are then the conservative ones, and refusing them would fault the owner.
+ inline bool clockFits(const Snapshot &s,uint64_t nativeHz) {
+-    return s.primary && s.primary->status==Status::Complete && nativeHz &&
+-        s.primary->pixelHz && s.primary->pixelHz<=nativeHz/2 && s.pipePixelHz &&
++    if(!s.primary || !s.pipePixelHz)return false;
++    const auto fits=[&](uint64_t hz) {return hz && hz<=(hz>s.pipePixelHz ? nativeHz : nativeHz/2);};
++    return s.primary->status==Status::Complete && nativeHz && fits(s.primary->pixelHz) &&
+         s.pipePixelHz<=nativeHz/2 && s.pipeLineTime==pipeLineTime(s.primary->htotal,s.pipePixelHz) &&
+-        (!s.cursorActive || (s.cursor && s.cursor->status==Status::Complete &&
+-            s.cursor->pixelHz && s.cursor->pixelHz<=nativeHz/2));
++        (!s.cursorActive || (s.cursor && s.cursor->status==Status::Complete && fits(s.cursor->pixelHz)));
+ }
+ enum class LatchCheck : uint32_t {None,Controls,OtherPlane,DSB,Clock,Registers,Live,Frame,AwaitingScanout,AwaitingFlip};
+ struct Latch {
+diff --git a/tests/display13_wm.cpp b/tests/display13_wm.cpp
+index 3853946..80a830c 100644
+--- a/tests/display13_wm.cpp
++++ b/tests/display13_wm.cpp
+@@ -316,9 +316,26 @@ int main() {
+     assert(!clockFits(clockPlan,296999999));
+     auto fasterCursor=cursor;fasterCursor.pixelHz=200000000;
+     auto cursorClockPlan=committed.snapshot(p,&fasterCursor);
++    // A cursor rate above the pipe's comes from the pipe scaler: limited by twice CDCLK, on its own.
++    assert(clockFits(cursorClockPlan,297000000) && !clockFits(cursorClockPlan,296999999));
++    fasterCursor.pixelHz=400000000;
+     assert(clockFits(cursorClockPlan,400000000) && !clockFits(cursorClockPlan,399999999));
+     clockPlan.pipePixelHz=200000000;clockPlan.pipeLineTime=pipeLineTime(p.htotal,clockPlan.pipePixelHz);
+     assert(!clockFits(clockPlan,384000000));
++    // Behind a pipe scaler the primary and cursor rates may reach twice CDCLK, the pipe's own clock still CDCLK.
++    auto scaledPrimary=p;scaledPrimary.pixelHz=784000000;
++    auto scaledCursor=cursor;scaledCursor.pixelHz=784000000;
++    auto scaledPlan=committed.snapshot(scaledPrimary,&scaledCursor);
++    scaledPlan.pipePixelHz=441050000;scaledPlan.pipeLineTime=pipeLineTime(scaledPrimary.htotal,scaledPlan.pipePixelHz);
++    assert(clockFits(scaledPlan,1305600000) && clockFits(scaledPlan,882100000) && !clockFits(scaledPlan,882099999));
++    scaledCursor.pixelHz=1400000000;
++    assert(!clockFits(scaledPlan,1305600000));
++    // Back at native size the cursor's plan still carries the scaled rate until the cursor changes.
++    auto nativePrimary=p;nativePrimary.pixelHz=441050000;
++    auto staleCursor=cursor;staleCursor.pixelHz=784000000;
++    auto backPlan=committed.snapshot(nativePrimary,&staleCursor);
++    backPlan.pipePixelHz=441050000;backPlan.pipeLineTime=pipeLineTime(nativePrimary.htotal,backPlan.pipePixelHz);
++    assert(clockFits(backPlan,1305600000) && !clockFits(backPlan,784000000-1));
+     LatchIO afterCrawl(p);afterCrawl.clock=1305600000;
+     assert(latch(afterCrawl,afterCrawl.snapshot(p)).status==Status::Complete && afterCrawl.writes.empty());
+     LatchIO sameFrame(p);sameFrame.frozen=true;
+-- 
+2.50.1 (Apple Git-155)
+

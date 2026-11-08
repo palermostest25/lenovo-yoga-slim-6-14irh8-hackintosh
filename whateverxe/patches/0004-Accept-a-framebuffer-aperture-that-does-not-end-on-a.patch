@@ -1,0 +1,73 @@
+From 175326c80b0482c788966e78c73ee23cd3c5f43b Mon Sep 17 00:00:00 2001
+From: thatisjigen <55486333+Thatisjigen@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:10:07 +0100
+Subject: [PATCH 04/11] Accept a framebuffer aperture that does not end on a
+ page
+
+The native byte count of a framebuffer is width x height x 4. At 2880x1800 that
+is 0x13C6800 and at 2880x1620 0x11CC400, neither a whole number of pages, and
+800x600, 1344x756 and 1600x900 are not either. apertureRange refuses them,
+wrapAlderLakeNAperture latches memoryFaulted, and the panel stays black until
+the next boot.
+
+The start must still be a page, and the last page must still be inside the pool
+and the aperture. The sub-descriptor keeps the native length. Whole-page sizes
+get the same answer as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ WhateverXe/kern_display13_fb_memory.hpp | 6 ++++--
+ tests/display13_fb_memory.cpp           | 5 +++++
+ tests/dsi_aperture_adapter.py           | 2 +-
+ 3 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/WhateverXe/kern_display13_fb_memory.hpp b/WhateverXe/kern_display13_fb_memory.hpp
+index 52c2a0d..296947f 100644
+--- a/WhateverXe/kern_display13_fb_memory.hpp
++++ b/WhateverXe/kern_display13_fb_memory.hpp
+@@ -267,9 +267,11 @@ inline bool sharedReservationAccepted(const SharedReservation &r,uint64_t manage
+ // A valid subrange alone does not prove the GGTT's mapping; inspect() does that.
+ // bootScanout=false verifies backing/ownership for a cold allocation without
+ // reading any pipe bank or treating the allocation as an active display.
++// The start is a page; the length is the native byte count, width x height x 4, which
++// need not be whole pages (2880x1620, 1600x900). Its last page must still be inside.
+ inline bool apertureRange(const Pool &p,uint32_t base,uint32_t bytes,uint64_t apertureBytes) {
+-    return bytes && !(base&4095) && !(bytes&4095) && base>=p.base &&
+-        uint64_t(base)+bytes<=uint64_t(p.base)+p.bytes && uint64_t(base)+bytes<=apertureBytes;
++    const auto end=uint64_t(base)+((uint64_t(bytes)+4095)&~uint64_t(4095));
++    return bytes && !(base&4095) && base>=p.base && end<=uint64_t(p.base)+p.bytes && end<=apertureBytes;
+ }
+ // Native IntelScaledModeData is a 64-byte CPU allocation. Its map/memory
+ // references are owned by the display pipe until native deallocateScanoutMemory.
+diff --git a/tests/display13_fb_memory.cpp b/tests/display13_fb_memory.cpp
+index 642997e..3fd7fce 100644
+--- a/tests/display13_fb_memory.cpp
++++ b/tests/display13_fb_memory.cpp
+@@ -291,6 +291,11 @@ int main() {
+     assert(!apertureRange(qualified.pool,0,0,0x10000000));
+     assert(!apertureRange(qualified.pool,1,4096,0x10000000));
+     assert(!apertureRange(qualified.pool,0,0x3000001,0x10000000));
++    // Width x height x 4 of a scaled desktop, not whole pages: 2880x1620, 1440x900, and a page-rounded end inside the pool.
++    assert(apertureRange(qualified.pool,0,0x11CC400,0x10000000));
++    assert(apertureRange(qualified.pool,0,0x57E400,0x10000000));
++    assert(apertureRange(qualified.pool,0,0x2FFFC00,0x10000000));
++    assert(!apertureRange(qualified.pool,0x2FFF000,0x1001,0x10000000));
+     assert(!apertureRange(qualified.pool,0x3000000,4096,0x10000000));
+     assert(!apertureRange(qualified.pool,0,0x800000,0x400000));
+     Fixture accelerator;put(accelerator.controller,0xC0,uintptr_t(1));
+diff --git a/tests/dsi_aperture_adapter.py b/tests/dsi_aperture_adapter.py
+index aabf130..dd47d31 100644
+--- a/tests/dsi_aperture_adapter.py
++++ b/tests/dsi_aperture_adapter.py
+@@ -48,7 +48,7 @@ int main(){
+   put(&controller,0x1A28,uint64_t(0x80000000));put(&controller,0x1A30,0x800000U);put(&controller,0x1A34,0x800U);
+   put(&controller,0xC80,&parent);c.pipe[0].memory.pool=pool(&controller);
+   pending=problem!=0;target=true;
+-  switch(problem){case 2:put(&fb,0x4314,1U);break;case 3:put(&fb,0x4330,1U);break;
++  switch(problem){case 2:put(&fb,0x4314,0x800001U);break;case 3:put(&fb,0x4330,1U);break;
+    case 4:c.pipe[0].memory.pool.pages++;break;case 5:target=false;break;case 6:xe.dsiStopAttempted=true;break;}
+   assert(!xe.wrapAlderLakeNAperture(&fb,0) && !depth && parent.refs==1);
+   assert(c.memoryFaulted==(problem>=2));
+-- 
+2.50.1 (Apple Git-155)
+

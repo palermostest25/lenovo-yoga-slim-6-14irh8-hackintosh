@@ -1,0 +1,68 @@
+From 47f230100dc7c7459ef958ccfc2b504683e3586c Mon Sep 17 00:00:00 2001
+From: retropineaple <118107729+retropineaple@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:10:47 +0100
+Subject: [PATCH 05/11] Display13 WM: accept pipe-scaler downscaled source
+ widths above htotal
+
+With a pipe scaler the source can be wider than htotal: a 3200-wide HiDPI
+surface on a 2880x1800 panel. linearLevel and yTiledLevel refuse that, the plan
+fails and the watermark owner faults until the next boot, so every downscaled
+mode loses the display. The pixel rate the caller passes already carries the
+downscale factor, as in i915, so allow up to three times htotal.
+
+Originally https://github.com/retropineaple/WhateverXe/commit/42950b7
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ WhateverXe/kern_display13_wm.hpp | 6 ++++--
+ tests/display13_wm.cpp           | 6 +++++-
+ 2 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/WhateverXe/kern_display13_wm.hpp b/WhateverXe/kern_display13_wm.hpp
+index b4cc458..4554f90 100644
+--- a/WhateverXe/kern_display13_wm.hpp
++++ b/WhateverXe/kern_display13_wm.hpp
+@@ -104,11 +104,13 @@ struct Plan {
+     uint64_t pixelHz {};
+     bool yTiled {};
+ };
++// A downscaled plane's source width can exceed htotal (pipe scaler); the caller's
++// pixel rate already carries the downscale factor, as in i915.
+ // Linear 32bpp RGB8888 or RGB2101010. The +1 block in blocks-per-line and method1, one-line
+ // minimum, 10% DDB margin and strict allocation inequality are all required.
+ inline Level linearLevel(uint32_t width,uint32_t htotal,uint64_t pixelHz,uint32_t latencyUs,uint32_t allocation) {
+     Level l;
+-    if(!latencyUs || !width || width>16384 || htotal<width || htotal>16384 ||
++    if(!latencyUs || !width || width>16384 || !htotal || width>3*htotal || htotal>16384 ||
+        !pixelHz || pixelHz>2000000000ULL || latencyUs>65793 || !allocation || allocation>4096)return l;
+     const auto bpl=ceilDiv(uint64_t(width)*4,512)+1;
+     const auto lineTime=ceilDiv(uint64_t(htotal)*1000000,pixelHz);
+@@ -164,7 +166,7 @@ inline bool cursorMatches(uint32_t control,uint32_t width,bool allowDisabled=fal
+ }
+ inline Level yTiledLevel(uint32_t width,uint32_t htotal,uint64_t pixelHz,uint32_t latencyUs,uint32_t allocation) {
+     Level l;
+-    if(!latencyUs || !width || width>16384 || htotal<width || htotal>16384 ||
++    if(!latencyUs || !width || width>16384 || !htotal || width>3*htotal || htotal>16384 ||
+        !pixelHz || pixelHz>2000000000ULL || latencyUs>65793 || !allocation || allocation>4096)return l;
+     const auto tileBlocks=ceilDiv(uint64_t(width)*4*4,512)+1;
+     const auto bpl=tileBlocks*65536/4;
+diff --git a/tests/display13_wm.cpp b/tests/display13_wm.cpp
+index a62f533..3853946 100644
+--- a/tests/display13_wm.cpp
++++ b/tests/display13_wm.cpp
+@@ -469,7 +469,11 @@ int main() {
+     assert(!linearLevel(1920,2200,148500000,5000,4096).enable);
+     assert(linearLevel(64,100,10000000,3,100).blocks==3); // Both byte counts below one block select method2.
+     assert(!linearLevel(0,2200,148500000,3,2008).enable);
+-    assert(!linearLevel(1920,1900,148500000,3,2008).enable);
++    // Pipe-scaler downscale: source width may exceed htotal, but not 3x it.
++    assert(linearLevel(1920,1900,148500000,3,2008).enable);
++    assert(!linearLevel(5701,1900,148500000,3,2008).enable);
++    // HP Envy 2880x1800 panel scanning a 3200-wide HiDPI surface (Y-tiled).
++    assert(yTiledLevel(3200,2960,448000000,3,641).enable);
+     assert(!linearLevel(1920,2200,0,3,2008).enable);
+     // All supported arithmetic remains bounded even at maximum PCODE block time.
+     assert(!linearLevel(16384,16384,2000000000ULL,65793,4096).enable);
+-- 
+2.50.1 (Apple Git-155)
+

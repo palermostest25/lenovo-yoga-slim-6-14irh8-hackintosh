@@ -1,0 +1,193 @@
+From 993cf7038b37fca78f5ae5b020a2669fe3730156 Mon Sep 17 00:00:00 2001
+From: palermostest25 <117061771+palermostest25@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 11:34:16 +0800
+Subject: [PATCH 11/11] Display13 eDP soft sleep (-wex-edp-softsleep): keep the
+ kept panel link through display sleep; OLED off/on over DPCD 0x720
+
+---
+ WhateverXe/kern_xe.cpp                  | 101 +++++++++++++++++++++++-
+ WhateverXe/kern_xe.hpp                  |   6 ++
+ tests/fixtures/boot_argument_names.json |   1 +
+ 3 files changed, 107 insertions(+), 1 deletion(-)
+
+diff --git a/WhateverXe/kern_xe.cpp b/WhateverXe/kern_xe.cpp
+index f3a9fd2..bdb8a6a 100644
+--- a/WhateverXe/kern_xe.cpp
++++ b/WhateverXe/kern_xe.cpp
+@@ -7304,6 +7304,33 @@ struct Display13EDPKeepRecord {
+  uint32_t live[9],wanted[8];uint8_t status[8];
+ };
+ static volatile uint32_t display13EDPKeepCalls=0,display13EDPKeepKept=0;
++// -wex-edp-softsleep (with -wex-edp-keep): display sleep and lid close keep the
++// kept panel link. Inside the donor's prepareToExitWake for the kept
++// framebuffer, disableDisplay(bool), setDPPowerState(D3) and
++// hwSetPanelPower(off) are skipped, so the pipe, link and panel stay up and the
++// wake-time mode set is kept again. The panel itself is switched off and on
++// over AUX (eDP DPCD 0x720 BACKLIGHT_ENABLE): an AUX-backlight OLED has no
++// backlight pin to clear. Same approach as KenzoPortela's TGL soft sleep (#37).
++static bool display13EDPSoftSleep() {
++ static int v=-1;if(v<0)v=checkKernelArgument("-wex-edp-softsleep") ? 1 : 0;
++ return v==1;
++}
++static void *volatile display13EDPKeptFB {};
++static void *volatile display13EDPKeptPort {};
++static void *volatile display13SoftSleepThread {};
++static volatile bool display13SoftSleepOff {};
++static volatile uint32_t display13SoftSleepCount[8] {};
++static bool display13SoftSleepActive(void *fb=nullptr) {
++ return display13SoftSleepThread==current_thread() && display13EDPKeptFB && (!fb || fb==display13EDPKeptFB);
++}
++// WEXEDPSoftSleep<what>: version, count, a, b. 0 sleep entered (a: OLED was on),
++// 1 OLED off / 2 OLED on (a: 0x720 before, b: read<<16 | write result low 16),
++// 3 panel power skipped, 4 disableDisplay skipped, 5 DP power skipped (a: state).
++static void display13SoftSleepRecord(uint32_t what,uint32_t a,uint32_t b) {
++ uint32_t r[4]={1,__sync_add_and_fetch(&display13SoftSleepCount[what&7],1),a,b};
++ char key[32];snprintf(key,sizeof(key),"WEXEDPSoftSleep%u",what);
++ IORegistryEntry::getRegistryRoot()->setProperty(key,r,sizeof(r));
++}
+ uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_t length) {
+  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
+  IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);IOLockUnlock(c.lock);
+@@ -7576,6 +7603,36 @@ bool XE::processDisplay13FramebufferSST(KernelPatcher &patcher,size_t index,mach
+    ready=patcher.routeMultiple(index,route,arrsize(route),address,size);patcher.clearError();
+   }
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPKeepReady",ready);
++  // -wex-edp-softsleep: four donor sites, entry and prologue checked against the
++  // Tahoe TGL framebuffer (Graphics 0.4.0). Short routes: prepareToExitWake has
++  // a RIP-relative operand 10 bytes in. Any mismatch routes nothing.
++  if(ready && display13EDPSoftSleep()) {
++   struct Site {const char *symbol;uint32_t offset;uint8_t entry[10];};
++   const Site sites[]={
++    {"__ZN21AppleIntelFramebuffer17prepareToExitWakeEv",0x25062,{0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x50}},
++    {"__ZN21AppleIntelFramebuffer18prepareToEnterWakeEv",0x25A4E,{0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55}},
++    {"__ZN21AppleIntelFramebuffer14disableDisplayEb",0x68900,{0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55}},
++    {"__ZN14AppleIntelPort15setDPPowerStateEh",0x1D8BC,{0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55}}
++   };
++   // processDisplay13Panel (hwSetPanelPower route) runs after this; the sleep
++   // wrapper requires display13PanelPowerReady at run time instead.
++   bool sleepReady=true;
++   for(const auto &site:sites) {
++    const auto f=patcher.solveSymbol<mach_vm_address_t>(index,site.symbol,address,size);patcher.clearError();
++    sleepReady=sleepReady && f==address+site.offset && !memcmp(reinterpret_cast<void *>(f),site.entry,sizeof(site.entry));
++   }
++   if(sleepReady) {
++    KernelPatcher::RouteRequest routes[] {
++     {sites[0].symbol,wrapDisplay13ExitWake,orgDisplay13ExitWake},
++     {sites[1].symbol,wrapDisplay13EnterWake,orgDisplay13EnterWake},
++     {sites[2].symbol,wrapDisplay13FBDisable,orgDisplay13FBDisable},
++     {sites[3].symbol,wrapDisplay13DPPower,orgDisplay13DPPower}
++    };
++    sleepReady=patcher.routeMultipleShort(index,routes,arrsize(routes),address,size);patcher.clearError();
++   }
++   IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPSoftSleepReady",sleepReady);
++   SYSLOG("igfx","eDP soft sleep routes %s",sleepReady?"installed":"not installed");
++  }
+  }
+  return display13FBSSTHooksReady;
+ }
+@@ -7805,7 +7862,7 @@ bool XE::wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *
+  }
+  record.reasons=reasons;
+  const bool keep=!(reasons&K::Blocking);
+- if(keep)record.kept=__sync_add_and_fetch(&display13EDPKeepKept,1);
++ if(keep){record.kept=__sync_add_and_fetch(&display13EDPKeepKept,1);display13EDPKeptFB=fb;display13EDPKeptPort=port;}
+  else record.kept=display13EDPKeepKept;
+  auto root=IORegistryEntry::getRegistryRoot();
+  if(record.call==1)root->setProperty("WEXEDPKeepFirst",&record,sizeof(record));
+@@ -7814,8 +7871,48 @@ bool XE::wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *
+   SYSLOG("igfx","eDP keep: firmware link kept on DDI %u, pipe A (sink status %02x %02x %02x)",record.ddi,record.status[0],record.status[1],record.status[2]);
+  else if(!keep && record.call==1)
+   SYSLOG("igfx","eDP keep: firmware link not kept (reasons 0x%x, state %u, sink status %02x %02x %02x)",reasons,record.state,record.status[0],record.status[1],record.status[2]);
++ else if(!keep && !(reasons&K::NotPanel))
++  SYSLOG("igfx","eDP keep: complete mode set on the panel (call %u, reasons 0x%x, sink status %02x %02x %02x)",record.call,reasons,record.status[0],record.status[1],record.status[2]);
+  return keep ? false : update;
+ }
++// -wex-edp-softsleep wrappers (see display13EDPSoftSleep).
++void XE::display13SoftSleepPanel(bool on) {
++ auto port=display13EDPKeptPort;if(!port)return;
++ uint8_t before=0xFF;
++ const auto read=wrapDisplay13ReadAUX(port,0x720,&before,1);
++ uint8_t want=read ? uint8_t(on?1:0) : uint8_t(on ? (before|1) : (before&~1));
++ const auto write=wrapDisplay13WriteAUX(port,0x720,&want,1);
++ display13SoftSleepRecord(on?2:1,read?0xFFFFFFFFU:before,((read&0xFFFF)<<16)|(write&0xFFFF));
++ SYSLOG("igfx","eDP soft sleep: panel %s over AUX (0x720 %02x -> %02x, read 0x%x, write 0x%x)",on?"on":"off",before,want,read,write);
++}
++uint64_t XE::wrapDisplay13ExitWake(void *fb) {
++ auto s=callbackXE;
++ const bool soft=display13EDPSoftSleep() && s->display13PanelPowerReady && fb && fb==display13EDPKeptFB;
++ if(soft) {
++  display13SoftSleepRecord(0,!display13SoftSleepOff,0);
++  if(!display13SoftSleepOff){display13SoftSleepPanel(false);display13SoftSleepOff=true;}
++  display13SoftSleepThread=current_thread();
++ }
++ const auto r=FunctionCast(wrapDisplay13ExitWake,s->orgDisplay13ExitWake)(fb);
++ if(soft)display13SoftSleepThread=nullptr;
++ return r;
++}
++uint64_t XE::wrapDisplay13EnterWake(void *fb) {
++ auto s=callbackXE;
++ const auto r=FunctionCast(wrapDisplay13EnterWake,s->orgDisplay13EnterWake)(fb);
++ if(fb && fb==display13EDPKeptFB && display13SoftSleepOff) {
++  display13SoftSleepPanel(true);display13SoftSleepOff=false;
++ }
++ return r;
++}
++void XE::wrapDisplay13FBDisable(void *fb,bool flag) {
++ if(display13SoftSleepActive(fb)){display13SoftSleepRecord(4,flag,0);return;}
++ FunctionCast(wrapDisplay13FBDisable,callbackXE->orgDisplay13FBDisable)(fb,flag);
++}
++uint32_t XE::wrapDisplay13DPPower(void *port,uint8_t state) {
++ if(state!=1 && port && port==display13EDPKeptPort && display13SoftSleepActive()){display13SoftSleepRecord(5,state,0);return 0;}
++ return FunctionCast(wrapDisplay13DPPower,callbackXE->orgDisplay13DPPower)(port,state);
++}
+ uint32_t XE::wrapDisplay13GMBus(IOService *controller,uint32_t bus,uint32_t speed,void *request) {
+     // Extending the donor's pin bound is not permission to use an arbitrary
+     // Type-C DDC bus. Only the retained controller's selected TMDS wiring
+@@ -13422,6 +13519,8 @@ void XE::display13PanelPWMEnable(void *access) {
+ }
+ uint32_t XE::wrapDisplay13PanelPower(void *controller,uint32_t state) {
+  auto s=callbackXE;auto &c=display13FBPower;
++ // -wex-edp-softsleep: the kept panel stays powered through display sleep.
++ if(state!=2 && display13SoftSleepActive()){display13SoftSleepRecord(3,state,0);return 0;}
+  if(!s->adlnOutputWiring.panel)return FunctionCast(wrapDisplay13PanelPower,s->orgDisplay13PanelPower)(controller,state);
+  if(!c.panelLock || !c.lock || !display13PanelCapture(controller))return kIOReturnNotReady;
+  IOLockLock(c.panelLock);IOLockLock(c.lock);Display13FBPanelIO io{c.map};Display13Panel::OnGate gate;
+diff --git a/WhateverXe/kern_xe.hpp b/WhateverXe/kern_xe.hpp
+index 61ce804..ba4c4be 100644
+--- a/WhateverXe/kern_xe.hpp
++++ b/WhateverXe/kern_xe.hpp
+@@ -200,6 +200,7 @@ private:
+  static uint32_t wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,bool flag);
+  mach_vm_address_t orgDisplay13TrainingPattern {},orgDisplay13SignalLevels {};
+  mach_vm_address_t orgDisplay13RegsNeedUpdate {};
++ mach_vm_address_t orgDisplay13ExitWake {},orgDisplay13EnterWake {},orgDisplay13FBDisable {},orgDisplay13DPPower {};
+  mach_vm_address_t orgDisplay13EnablePort {},orgDisplay13DisablePort {};
+  static bool display13MainLinkAUX(void *port,bool acquire,bool stopping=false);
+  static uint32_t wrapDisplay13EnablePort(void *port);
+@@ -221,6 +222,11 @@ private:
+  static bool display13HDMIPort(void *port);
+  static uint32_t wrapDisplay13TrainingPattern(void *path,uint32_t pattern);
+  static bool wrapDisplay13RegsNeedUpdate(void *controller,void *fb,void *path,void *params,const void *timing,void *scaler);
++ static uint64_t wrapDisplay13ExitWake(void *fb);
++ static uint64_t wrapDisplay13EnterWake(void *fb);
++ static void wrapDisplay13FBDisable(void *fb,bool flag);
++ static uint32_t wrapDisplay13DPPower(void *port,uint8_t state);
++ static void display13SoftSleepPanel(bool on);
+  static uint32_t wrapDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphasis,void *overrideConfig);
+ 	mach_vm_address_t xelpProviderProbe {},xelpProviderConfigureProbe {};
+  bool display13DPAltProbeReady {},display13DPProbeReady {},display13TCProbeReady {},display13TCDPProbeReady {},display13FBDPHooksReady {};
+diff --git a/tests/fixtures/boot_argument_names.json b/tests/fixtures/boot_argument_names.json
+index c7aac0a..cc3e5e9 100644
+--- a/tests/fixtures/boot_argument_names.json
++++ b/tests/fixtures/boot_argument_names.json
+@@ -147,6 +147,7 @@
+   "-wex-adlp-load-only": [],
+   "-wex-display13-offline": [],
+   "-wex-edp-keep": [],
++  "-wex-edp-softsleep": [],
+   "-wex-dsi-hdmi-test": [],
+   "-wex-dsi-power-test": []
+ }
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,33 @@
+From 41b0ded159be9e80751e6cd2a8208f3a532a7751 Mon Sep 17 00:00:00 2001
+From: retropineaple <118107729+retropineaple@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:10:47 +0100
+Subject: [PATCH 06/11] Display13 WM latch: accept downscaled source heights
+ above vtotal
+
+Display13WM::latch refused a primary taller than vtotal, which a pipe scaler
+downscaling a HiDPI surface produces. Allow up to three times vtotal, the same
+bound as for the width.
+
+Originally https://github.com/retropineaple/WhateverXe/commit/278a623
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ WhateverXe/kern_display13_wm.hpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/WhateverXe/kern_display13_wm.hpp b/WhateverXe/kern_display13_wm.hpp
+index 4554f90..8c1b55d 100644
+--- a/WhateverXe/kern_display13_wm.hpp
++++ b/WhateverXe/kern_display13_wm.hpp
+@@ -340,7 +340,7 @@ template<class IO> Latch latch(IO &io,const Snapshot &s) {
+     if(!Display13FBIRQ::powered(wells,s.pipeIndex)) {r.status=Status::Power;return r;}
+     const auto ht=io.read(timing),vt=io.read(timing+0xC);
+     const auto htotal=((ht>>16)&0x3FFF)+1,vtotal=((vt>>16)&0x3FFF)+1;
+-    if(ht==UINT32_MAX || vt==UINT32_MAX || htotal!=s.primary->htotal || !s.primary->height || s.primary->height>8192 || vtotal<s.primary->height || !s.primary->pixelHz) {r.status=Status::Input;return r;}
++    if(ht==UINT32_MAX || vt==UINT32_MAX || htotal!=s.primary->htotal || !s.primary->height || s.primary->height>8192 || s.primary->height>3*vtotal || !s.primary->pixelHz) {r.status=Status::Input;return r;}
+     const auto period=ceilDiv(uint64_t(htotal)*vtotal*1000000,s.pipePixelHz);
+     if(period<1000 || period>100000) {r.status=Status::Input;return r;}
+     r.budgetUs=static_cast<uint32_t>(3*period+1000);
+-- 
+2.50.1 (Apple Git-155)
+
