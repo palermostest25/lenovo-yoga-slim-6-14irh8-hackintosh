@@ -30,6 +30,6 @@ with a patched WhateverXe (`whateverxe/patches`, on top of upstream 0.7.0 `d0b7f
 ## Open work
 
 1. Full system sleep (S3 resume does a complete mode set). `tools/Install-Lid-Hibernate.command` works around it: screen off on lid close, then `hibernatemode 25`.
-2. Hibernate wake restarts once before booting (`HibernateMode = None`). `Auto` is untested, and it isn't confirmed that the session is restored.
+2. Hibernate wake restores the session, but with `HibernateMode = None` it restarted once first. The EFI now has `Auto`, not yet confirmed to stop the restart. If it makes waking worse, go back to `None`.
 3. AirDrop and Continuity are not possible with the Intel CNVi Wi-Fi/Bluetooth.
 4. Thunderbolt: no macOS driver loads for the built-in controllers (`8086:A73E`, `A76D`).
