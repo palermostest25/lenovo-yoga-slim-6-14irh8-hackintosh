@@ -14,15 +14,18 @@ with the patches in [`whateverxe/patches`](whateverxe/patches).
 | Internal 1920x1200 OLED | Works |
 | Scaled resolutions ("Larger Text" / "More Space") | Work |
 | Brightness slider | Works (AuxDim) |
-| Display sleep and lid close | Work |
+| Display sleep | Works |
+| Lid close | Screen off, then hibernates 5 minutes later; nothing when docked (section 6) |
 | External USB-C / HDMI monitor | Works |
 | Bluetooth | Works (Intel AX211). Continuity features are limited |
 | AirDrop | **Not supported**: the Intel Wi-Fi driver has no AWDL |
-| Full system sleep | **Not supported**: the panel goes dark on resume. Turn it off (see below) |
+| Hibernation (`hibernatemode 25`) | Powers off and comes back with the screen working. Waking restarts once first (see Known issues) |
+| Full system sleep | **Not supported**: the panel goes dark on resume. The lid watcher turns it off |
+| Thunderbolt | **Not working**: no macOS driver loads for the built-in controllers. USB-C still does USB and screens |
 
 ## What changes from stock, and why
 
-"Stock" is the EFI this started from, with the official WhateverXe **0.7.0** release. Five things differ.
+"Stock" is the EFI this started from, with the official WhateverXe **0.7.0** release. Six things differ.
 
 ### 1. WhateverXe: patched build instead of the official 0.7.0
 
@@ -83,6 +86,19 @@ Re-map it if your board differs. In Windows, disable the **Parsec Virtual USB Ad
 
 The NVRAM keys `bluetoothExternalDongleFailed = 00` and `bluetoothInternalControllerInfo = 14 zero bytes` were already set, and stay set.
 
+### 6. Lid watcher (macOS, not the EFI)
+
+Full system sleep leaves this panel dark, so the lid can't use it. [`tools/Install-Lid-Hibernate.command`](tools/Install-Lid-Hibernate.command) installs a small background script instead:
+
+| Lid shut and... | What happens |
+| --- | --- |
+| Not docked | Screen off straight away, hibernate 5 minutes later |
+| Docked (DisplayLink dock or external screen) | Nothing: screens stay on, laptop stays awake |
+| Opened within the 5 minutes | Hibernate cancelled |
+
+It sets `hibernatemode 25` and `disablesleep 1`, because macOS otherwise sleeps the moment the lid shuts, and lifts `disablesleep` only to hibernate.
+To change the delay, edit `DELAY=300` in `/Library/Scripts/lid-hibernate.sh` and reboot.
+
 Everything else (SMBIOS `MacBookPro16,2`, other kexts, ACPI, quirks) is unchanged.
 
 ## Setup
@@ -92,17 +108,17 @@ Everything else (SMBIOS `MacBookPro16,2`, other kexts, ACPI, quirks) is unchange
 2. OpenCore `UEFI > Output > Resolution` must stay **`Max`**, so the firmware leaves the panel at native 1920x1200.
 3. Copy `EFI/` to the USB stick or the internal disk's EFI partition.
 4. In macOS, install **WhateverXe Graphics 0.4.0** (the pkg), then reboot. The keep patch checks the exact Apple driver from that package. With another version it switches itself off, and the internal panel stays dark.
-5. Turn off full system sleep (display sleep and lid close are fine):
-   ```bash
-   sudo pmset -a disablesleep 1
-   ```
+5. Run `tools/Install-Lid-Hibernate.command` once (section 6). It starts by itself at every boot.
 6. Optional: HiDPI ("looks like 1280x800" etc.) with [one-key-hidpi](https://github.com/xzhih/one-key-hidpi) or [BetterDisplay](https://github.com/waydabber/BetterDisplay).
 
 ## Known issues
 
 - **AirDrop** doesn't work, and Handoff and Universal Clipboard are unreliable. The Intel Wi-Fi driver has no AWDL, and Intel Bluetooth is only partly Continuity-compatible. The Wi-Fi is the chipset-integrated CNVi type (`8086:51F1`), so a Broadcom card isn't an option. Use [LocalSend](https://localsend.org) for file transfer.
 - **Bluetooth** may drop out now and then; others report this with Intel Bluetooth on Tahoe. Toggle it off and on, or reboot.
-- **Full system sleep (S3)**: the panel stays dark on resume. Keep `disablesleep 1`.
+- **Full system sleep (S3)**: the panel stays dark on resume. The lid watcher keeps it off with `disablesleep 1`.
+- **Waking from hibernation** goes through the OpenCore menu, restarts once, then boots on the second try. This EFI has `HibernateMode = None`; `Auto` is untested.
+- **Docked with the lid shut**, the lid watcher leaves the internal OLED alone, because `pmset` can only turn off every screen at once.
+- **Thunderbolt docks** don't work. A DisplayLink USB-C dock works plugged straight into the laptop, but not through a Thunderbolt dock.
 - **A real change of the panel timing** (not a scaled mode) is not kept and goes dark. macOS normally only offers scaled modes for this panel.
 - `SimpleHDA.kext` is enabled. On another WhateverXe machine it crashed when a DisplayPort screen connected. If you see `AppleHDAHDMI_DPDriver` panics, disable it.
 
