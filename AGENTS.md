@@ -25,8 +25,9 @@ with a patched WhateverXe (`whateverxe/patches`, on top of upstream 0.7.0 `d0b7f
 - A black boot still leaves a kernel log. Boot a working EFI and run `tools/Collect-Yoga-Graphics.command`; it includes the previous 3 hours.
 - Look for `eDP keep:` and `eDP soft sleep` lines, and the `WEXEDPKeepFirst` / `WEXEDPKeep` / `WEXEDPSoftSleep*` registry records.
 - `Phase 2 of link training failed` means something made the driver retrain the panel. Find out why the keep decision refused (the reasons bitmask in `kern_display13_edp_keep.hpp`).
+- Bluetooth: `ReadLocalVersionInformation failed: STATUS 408` / `HCI initialization failed` means the AX211 isn't answering; check the kext versions (2.5.3+) before the USB map.
 
 ## Open work
 
-1. Bluetooth (likely a custom USB map to replace `UTBDefault`).
-2. Full system sleep (S3 resume does a complete mode set).
+1. Full system sleep (S3 resume does a complete mode set).
+2. AirDrop and Continuity are not possible with the Intel CNVi Wi-Fi/Bluetooth.
